@@ -336,6 +336,7 @@ class SamplesGenerator:
         batch_size = (len(all_prompt_token_ids) + len(llms) - 1) // len(llms)
         for i, llm in enumerate(llms):
             prompt_token_ids = all_prompt_token_ids[i * batch_size : (i + 1) * batch_size]
+            # 这里以add_requests的方式使用vllm engine调用了生成。
             refs.append(llm.add_requests.remote(sampling_params=sampling_params, prompt_token_ids=prompt_token_ids))
         ray.get(refs)
 

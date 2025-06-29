@@ -10,6 +10,10 @@ from openrlhf.utils.logging_utils import init_logger
 
 from .utils import get_bundle_indices, ray_noset_visible_devices
 
+import io
+import torch
+from vllm import LLM
+
 logger = init_logger(__name__)
 
 
@@ -28,6 +32,9 @@ class BaseLLMRayActor:
             # a hack to make the script work.
             # stop ray from manipulating *_VISIBLE_DEVICES
             # at the top-level when the distributed_executor_backend is ray.
+            # chuanwei.tang: Ray control visibility of GPU for actors
+            # by setting *_VISIBLE_DEVICES automatically which conflicts with
+            # counterparts among environment variables.
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
             os.environ.pop("HIP_VISIBLE_DEVICES", None)
@@ -107,6 +114,19 @@ class LLMRayActor(BaseLLMRayActor):
         Return the responses for the actor with the given rank
         """
         return self.response_queues.get()
+
+    def generate_multimodal(self, prompts, sampling_params, multi_modal_data):
+        """
+        支持多模态（图片+文本）推理的接口。
+        prompts: List[str]
+        multi_modal_data: List[dict]，每个dict如 {"image": PIL.Image}
+        """
+        outputs = self.llm.generate(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            multi_modal_data=multi_modal_data
+        )
+        return outputs
 
 
 def create_vllm_engines(

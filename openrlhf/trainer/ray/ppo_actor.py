@@ -272,6 +272,7 @@ class ActorPPOTrainer(ABC):
         if self.args.use_dynamic_batch:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
+        # 下面两行是使用deepspeed引擎进行的反向传播和梯度更新。
         self.strategy.backward(loss, self.actor, self.actor_optim)
         if self.args.use_dynamic_batch:
             if self.replay_buffer.dynamic_optimizer_step[step]:
@@ -496,7 +497,7 @@ class PolicyModelActor(BaseModelActor):
     def fit(self, kl_ctl: float = 0):
         """Train actor model with the replay buffer."""
         torch.cuda.empty_cache()
-        self.actor.train()
+        self.actor.train()      # 将模型设置为train()模式，与eval()相对
         status = self.trainer.ppo_train(kl_ctl)
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
