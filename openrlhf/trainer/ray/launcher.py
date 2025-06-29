@@ -355,3 +355,10 @@ class RayActorGroup:
                 refs.append(actor.execute_batch.remote(method_name, all_data_ref, start_idx, end_idx))
 
         return refs
+
+    def broadcast_weights(self):
+        """
+        调用group内所有actor的sync_weights方法，实现权重同步。
+        """
+        refs = [a.sync_weights.remote() for a in self._actor_handlers]
+        ray.get(refs)
