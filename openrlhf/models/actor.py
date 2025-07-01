@@ -41,6 +41,7 @@ class Actor(nn.Module):
         attn_implementation="flash_attention_2",
         bf16=True,
         load_in_4bit=False,
+        load_in_8bit=False,
         lora_rank=0,
         lora_alpha=16,
         lora_dropout=0,
@@ -73,6 +74,12 @@ class Actor(nn.Module):
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+            elif load_in_8bit:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_threshold=6.0,              # 控制 outlier threshold，可调降低精度损失
+                    llm_int8_enable_fp32_cpu_offload=True  # 若显存不足，可将一些权重卸载到 CPU
                 )
             else:
                 nf4_config = None
