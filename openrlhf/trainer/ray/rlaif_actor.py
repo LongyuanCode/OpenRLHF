@@ -22,8 +22,8 @@ class TargetModelActor(BaseModelActor):
         model = Actor(
             pretrain,
             use_flash_attention_2=strategy.args.flash_attn,
-            bf16=strategy.args.bf16,
-            load_in_4bit=strategy.args.load_in_4bit,
+            bf16=strategy.args.target_bf16,
+            load_in_4bit=strategy.args.target_load_in_4bit,
             ds_config=strategy.get_ds_train_config(is_actor=True),
             packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,
@@ -319,12 +319,12 @@ class TargetModelActor(BaseModelActor):
 
 class LabelerModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
-        self._setup_distributed(strategy)
+        self._setup_distributed(strategy)   # TODO：只推理的模型不需要用deepspeed封装
         model_labeler = Actor(
             pretrain,
             use_flash_attention_2=strategy.args.flash_attn,
-            bf16=strategy.args.bf16,
-            load_in_4bit=strategy.args.load_in_4bit,
+            bf16=strategy.args.labeler_bf16,
+            load_in_8bit=strategy.args.labeler_load_in_8bit,
             ds_config=strategy.get_ds_eval_config(offload=strategy.args.ref_reward_offload),
             packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,

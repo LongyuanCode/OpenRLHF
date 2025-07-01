@@ -40,6 +40,7 @@ class Actor(nn.Module):
         use_flash_attention_2=False,
         bf16=True,
         load_in_4bit=False,
+        load_in_8bit=False,
         lora_rank=0,
         lora_alpha=16,
         lora_dropout=0,
@@ -72,6 +73,12 @@ class Actor(nn.Module):
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
                 )
+            elif load_in_8bit:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_threshold=6.0,              # 控制 outlier threshold，可调降低精度损失
+                    llm_int8_enable_fp32_cpu_offload=True  # 若显存不足，可将一些权重卸载到 CPU
+                )
             else:
                 nf4_config = None
 
@@ -82,14 +89,25 @@ class Actor(nn.Module):
             else:
                 model_class = AutoModelForCausalLM
 
-            self.model = model_class.from_pretrained(
-                pretrain_or_model,
-                trust_remote_code=True,
-                attn_implementation=attn_implementation,
-                quantization_config=nf4_config,
-                torch_dtype=torch.bfloat16 if bf16 else "auto",
-                device_map=device_map,
-            )
+            if load_in_4bit:
+                self.model = model_class.from_pretrained(
+                    pretrain_or_model,
+                    trust_remote_code=True,
+                    attn_implementation=attn_implementation,
+                    quantization_config=nf4_config,
+                    torch_dtype=torch.bfloat16 if bf16 else "auto",
+                    device_map=device_map,
+                )
+            elif load_in_8bit:
+                self.model = model_class.from_pretrained(
+                    pretrain_or_model,
+                    trust_remote_code=True,
+                    attn_implementation=attn_implementation,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,         # LayerNorm 等保持 FP16
+                    low_cpu_mem_usage=True
+                )
 
             # LoRA
             if lora_rank > 0:
