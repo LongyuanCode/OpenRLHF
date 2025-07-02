@@ -12,86 +12,7 @@ from typing import Dict
 
 class TargetModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
-        self._setup_distributed(strategy)
-        args = strategy.args
-        
-        # Store vLLM engines for generation
-        self.vllm_engines = vllm_engines
-        
-        # Create model for training (with DeepSpeed support)
-        model = Actor(
-            pretrain,
-            use_flash_attention_2=strategy.args.flash_attn,
-            bf16=strategy.args.target_bf16,
-            load_in_4bit=strategy.args.target_load_in_4bit,
-            ds_config=strategy.get_ds_train_config(is_actor=True),
-            packing_samples=strategy.args.packing_samples,
-            temperature=strategy.args.temperature,
-            use_liger_kernel=strategy.args.use_liger_kernel,
-        )
-        
-        strategy.print('model:\n', model)
-
-        # Prepare training model with optimizer and scheduler
-        if max_steps is not None:
-            # Create optimizer
-            train_optim = strategy.create_optimizer(
-                model, 
-                lr=args.actor_learning_rate, 
-                betas=strategy.args.adam_betas, 
-                weight_decay=args.l2
-            )
-
-            # Create scheduler
-            train_scheduler = get_scheduler(
-                args.lr_scheduler,
-                train_optim,
-                num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
-                num_training_steps=max_steps,
-                scheduler_specific_kwargs={"min_lr": args.actor_learning_rate * 0.1},
-            )
-
-            # Prepare training model with DeepSpeed
-            self.model, self.train_optim, self.train_scheduler = strategy.prepare(
-                (model, train_optim, train_scheduler),
-                is_rlhf=True,
-            )
-        else:
-            self.model = None
-            self.train_optim = None
-            self.train_scheduler = None
-        
-        # Initialize tokenizer
-        from openrlhf.utils import get_tokenizer
-        self.tokenizer = get_tokenizer(
-            pretrain, 
-            self.model, 
-            "left", 
-            strategy, 
-            use_fast=not strategy.args.disable_fast_tokenizer
-        )
-    
-    def set_train(self):
-        if getattr(self, "_rank", 0) == 0 and self.model is not None:
-            self.model.train()
-
-    def set_eval(self):
-        if self.model is not None:
-            self.model.eval()
-
-    def backward_and_optimize(self, loss):
-        """Perform backward pass and optimization using DeepSpeed"""
-        if getattr(self, "_rank", 0) == 0 and self.model is not None:
-            # Backward pass
-            self.strategy.backward(loss, self.model, self.train_optim)
-            
-            # Optimizer step
-            self.strategy.optimizer_step(self.train_optim, self.model, self.train_scheduler, name="actor")
-            
-            # Sync weights between training and generation models if needed
-            # This is a simplified approach - in practice you might want more sophisticated sync
-            if hasattr(self, 'sync_weights'):
-                self.sync_weights()
+        raise NotImplementedError
 
     def sync_weights(self):
         """
@@ -124,65 +45,6 @@ class TargetModelActor(BaseModelActor):
 
     def _sync_weights_zero3(self):
         self.sync_weights()
-
-    def forward(
-            self,
-            input_ids,
-            attention_mask,
-            questions,
-            item_indexes,
-            pixel_values=None,
-            n_candidates=5,
-            **gen_kwargs):
-        """
-        Args:
-            input_ids: (batch, seq_len) 输入 token IDs
-            attention_mask: (batch, seq_len) attention mask
-            pixel_values: 图像输入（可选）
-            n_candidates: int，采样生成的候选数量 n
-            questions: List[str]，每个样本的问题文本（可选，若无则用空串）
-            item_indexes: List[str]，每个条数据在数据集中的idx。
-            gen_kwargs: 传给 model.generate 的参数，如 temperature、top_p、max_new_tokens 等
-        Returns:
-            List[{"question": str, "candidate_response": List[str]}]，每个元素包含原始问题和其n个生成的候选回答
-        """
-
-        # 训练模式下，直接 forward 并计算 loss 或 logits
-        if self.model.training:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                labels=input_ids,  # 或按具体训练需求设置 labels
-            )
-            return outputs.logits
-
-        # 评估模式下，生成 n_candidates 个候选回复
-        batch_size = input_ids.shape[0]
-        all_candidates = [[] for _ in range(batch_size)]
-        
-        # 优先使用vLLM engine进行生成
-        if self.vllm_engines is not None:
-            # 使用vLLM engine进行批量生成
-            all_candidates = self._generate_with_vllm_engines(
-                questions, item_indexes, pixel_values, n_candidates, **gen_kwargs
-            )
-        else:
-            # 回退到模型直接生成
-            all_candidates = self._generate_with_model(
-                input_ids, attention_mask, pixel_values, n_candidates, **gen_kwargs
-            )
-        
-        # 构造返回结果
-        results = []
-        for i in range(batch_size):
-            results.append({
-                'question': questions[i] if questions else '',
-                'candidate_response': all_candidates[i],
-                'idx': item_indexes[i] if item_indexes else i
-            })
-        
-        return results
     
     def _generate_with_vllm_engines(self, questions, item_indexes, pixel_values, n_candidates, **gen_kwargs):
         """使用vLLM engine进行生成，支持多模态（图片+文本）和纯文本"""
@@ -316,6 +178,234 @@ class TargetModelActor(BaseModelActor):
                     all_candidates[i].append(generated_text)
         
         return all_candidates
+
+class PolicyModelActor(TargetModelActor):
+    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
+        self._setup_distributed(strategy)
+        args = strategy.args
+        
+        # Store vLLM engines for generation
+        self.vllm_engines = vllm_engines
+        
+        # Create model for training (with DeepSpeed support)
+        model = Actor(
+            pretrain,
+            use_flash_attention_2=strategy.args.use_flash_attn_policy,
+            bf16=strategy.args.target_bf16,
+            load_in_4bit=strategy.args.target_load_in_4bit,
+            ds_config=strategy.get_ds_train_config(is_actor=True),
+            # TODO: packing_samples=strategy.args.packing_samples,
+            temperature=strategy.args.temperature,
+            use_liger_kernel=strategy.args.use_liger_kernel,
+        )
+        
+        strategy.print('model:\n', model)
+
+        # Prepare training model with optimizer and scheduler
+        if max_steps is not None:
+            # Create optimizer
+            train_optim = strategy.create_optimizer(
+                model, 
+                lr=args.actor_learning_rate, 
+                betas=strategy.args.adam_betas, 
+                weight_decay=args.l2
+            )
+
+            # Create scheduler
+            train_scheduler = get_scheduler(
+                args.lr_scheduler,
+                train_optim,
+                num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
+                num_training_steps=max_steps,
+                scheduler_specific_kwargs={"min_lr": args.actor_learning_rate * 0.1},
+            )
+
+            # Prepare training model with DeepSpeed
+            self.model, self.train_optim, self.train_scheduler = strategy.prepare(
+                (model, train_optim, train_scheduler),
+                is_rlhf=True,
+            )
+        else:
+            self.model = None
+            self.train_optim = None
+            self.train_scheduler = None
+        
+        # Initialize tokenizer
+        from openrlhf.utils import get_tokenizer
+        self.tokenizer = get_tokenizer(
+            pretrain, 
+            self.model, 
+            "left", 
+            strategy, 
+            use_fast=not strategy.args.disable_fast_tokenizer
+        )
+
+    def set_train(self):
+        if getattr(self, "_rank", 0) == 0 and self.model is not None:
+            self.model.train()
+
+    def set_eval(self):
+        if self.model is not None:
+            self.model.eval()
+
+    def backward_and_optimize(self, loss):
+        """Perform backward pass and optimization using DeepSpeed"""
+        if getattr(self, "_rank", 0) == 0 and self.model is not None:
+            # Backward pass
+            self.strategy.backward(loss, self.model, self.train_optim)
+            
+            # Optimizer step
+            self.strategy.optimizer_step(self.train_optim, self.model, self.train_scheduler, name="actor")
+            
+            # Sync weights between training and generation models if needed
+            # This is a simplified approach - in practice you might want more sophisticated sync
+            if hasattr(self, 'sync_weights'):
+                self.sync_weights()
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        questions,
+        item_indexes,
+        pixel_values=None,
+        n_candidates=5,
+        **gen_kwargs
+    ):
+        """
+        Args:
+            input_ids: (batch, seq_len) 输入 token IDs
+            attention_mask: (batch, seq_len) attention mask
+            pixel_values: 图像输入（可选）
+            n_candidates: int，采样生成的候选数量 n
+            questions: List[str]，每个样本的问题文本（可选，若无则用空串）
+            item_indexes: List[str]，每个条数据在数据集中的idx。
+            gen_kwargs: 传给 model.generate 的参数，如 temperature、top_p、max_new_tokens 等
+        Returns:
+            List[{"question": str, "candidate_response": List[str]}]，每个元素包含原始问题和其n个生成的候选回答
+        """
+        # 训练模式下，直接 forward 并计算 loss 或 logits
+        if self.model.training:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                labels=input_ids,  # 或按具体训练需求设置 labels
+            )
+            return outputs.logits
+
+        # 评估模式下，生成 n_candidates 个候选回复
+        batch_size = input_ids.shape[0]
+        all_candidates = [[] for _ in range(batch_size)]
+        
+        # 优先使用vLLM engine进行生成
+        if self.vllm_engines is not None:
+            # 使用vLLM engine进行批量生成
+            all_candidates = self._generate_with_vllm_engines(
+                questions, item_indexes, pixel_values, n_candidates, **gen_kwargs
+            )
+        else:
+            # 回退到模型直接生成
+            all_candidates = self._generate_with_model(
+                input_ids, attention_mask, pixel_values, n_candidates, **gen_kwargs
+            )
+        
+        # 构造返回结果
+        results = []
+        for i in range(batch_size):
+            results.append({
+                'question': questions[i] if questions else '',
+                'candidate_response': all_candidates[i],
+                'idx': item_indexes[i] if item_indexes else i
+            })
+        
+        return results
+
+class ReferenceModelActor(BaseModelActor):
+    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, vllm_engines=None):
+        self._setup_distributed(strategy)
+        args = strategy.args
+        self.vllm_engines = vllm_engines
+        # Only inference model, no optimizer/scheduler
+        model = Actor(
+            pretrain,
+            use_flash_attention_2=args.use_flash_attn_ref,
+            bf16=args.ref_bf16,
+            temperature=args.temperature,
+            use_liger_kernel=args.use_liger_kernel,
+        )
+        strategy.print('model:\n', model)
+        self.model = strategy.prepare(model, is_rlhf=True)
+        self.model.eval()
+        from openrlhf.utils import get_tokenizer
+        self.tokenizer = get_tokenizer(
+            pretrain,
+            self.model,
+            "left",
+            strategy,
+            use_fast=not args.disable_fast_tokenizer
+        )
+
+    def batch_logp(self, contexts, targets, images=None):
+        """
+        Efficient batch logp calculation for DPO, supports images (optional).
+        Args:
+            contexts: List[str], context prompts
+            targets: List[str], target completions
+            images: List[Tensor or None], optional images
+        Returns:
+            List[float]: logp for each sample
+        """
+        import torch
+        prompts = []
+        target_lengths = []
+        for context, target in zip(contexts, targets):
+            prompts.append(context)
+            target_lengths.append(len(self.tokenizer.encode(target)))
+        input_ids = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length
+        ).input_ids
+        target_ids = self.tokenizer(
+            targets,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length
+        ).input_ids
+        input_ids = torch.cat([input_ids, target_ids], dim=1)
+        attention_mask = torch.ones_like(input_ids)
+        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
+        if images is not None and any(img is not None for img in images):
+            pixel_values = []
+            for img in images:
+                if img is not None:
+                    pixel_values.append(img)
+                else:
+                    pixel_values.append(torch.zeros(3, 224, 224))
+            pixel_values = torch.stack(pixel_values)
+            model_inputs["pixel_values"] = pixel_values
+        device = next(self.model.parameters()).device
+        for k, v in model_inputs.items():
+            if isinstance(v, torch.Tensor):
+                model_inputs[k] = v.to(device)
+        with torch.no_grad():
+            outputs = self.model(**model_inputs)
+        logits = outputs.logits
+        batch_logps = []
+        for i in range(len(contexts)):
+            target_start = input_ids.shape[1] - target_ids.shape[1]
+            target_logits = logits[i, target_start:, :]
+            target_tokens = target_ids[i, :]
+            log_probs = torch.log_softmax(target_logits, dim=-1)
+            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
+            mask = target_tokens != self.tokenizer.pad_token_id
+            sample_logp = (target_logp * mask.float()).sum()
+            batch_logps.append(sample_logp.detach().cpu())
+        return batch_logps
 
 class LabelerModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
