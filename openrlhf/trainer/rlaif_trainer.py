@@ -339,20 +339,21 @@ class RLAIFTrainer:
                 images.append(image)
             
             # Calculate log probabilities using reference model (no gradients needed)
-            reference_chosen_logps = self.get_logp_batch(
-                self.reference_model_group.master.model, 
-                contexts, 
-                preferred_targets, 
-                images, 
-                requires_grad=False
+            # 使用Ray分布式并行logp计算
+            ref_chosen_futures = self.reference_model_group.async_run_method_batch(
+                method_name="batch_logp",
+                contexts=contexts,
+                targets=preferred_targets,
+                images=images
             )
-            reference_rejected_logps = self.get_logp_batch(
-                self.reference_model_group.master.model, 
-                contexts, 
-                inferior_targets, 
-                images, 
-                requires_grad=False
+            ref_rejected_futures = self.reference_model_group.async_run_method_batch(
+                method_name="batch_logp",
+                contexts=contexts,
+                targets=inferior_targets,
+                images=images
             )
+            reference_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(ref_chosen_futures))))
+            reference_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(ref_rejected_futures))))
             
             # Calculate policy model log probabilities (with gradients for training)
             policy_chosen_logps = self.get_logp_batch(
@@ -371,7 +372,7 @@ class RLAIFTrainer:
             )
             
             # Calculate DPO loss
-            loss, chosen_rewards, rejected_rewards = dpo_loss_fn(
+            loss, _, _ = dpo_loss_fn(
                 policy_chosen_logps,
                 policy_rejected_logps,
                 reference_chosen_logps,

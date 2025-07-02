@@ -7,7 +7,7 @@ from openrlhf.trainer.ray.launcher import RayActorGroup
 
 from openrlhf.utils import get_strategy
 
-from openrlhf.trainer.ray.rlaif_actor import TargetModelActor, LabelerModelActor
+from openrlhf.trainer.ray.rlaif_actor import PolicyModelActor, ReferenceModelActor, LabelerModelActor
 
 def train(args):
     if not ray.is_initialized():
@@ -27,7 +27,7 @@ def train(args):
     policy_group = RayActorGroup(
         num_nodes=1,
         num_gpus_per_node=2,
-        ray_actor_type=TargetModelActor,
+        ray_actor_type=PolicyModelActor,
         pg=pg_policy,
         num_gpus_per_actor=1,                # 不用整卡 GPU
         resources=None,
@@ -40,7 +40,7 @@ def train(args):
     reference_group = RayActorGroup(
         num_nodes=1,
         num_gpus_per_node=2,
-        ray_actor_type=TargetModelActor,
+        ray_actor_type=ReferenceModelActor,
         pg=pg_ref,
         num_gpus_per_actor=1,
         resources=None
@@ -95,22 +95,6 @@ def train(args):
             args.agent_func_path_policy,
             shared_pg=policy_group,
         )
-
-        reference_vllm_engines = create_vllm_engines(
-            2,
-            1,
-            args.pretrain_ref,
-            args.seed_ref,
-            args.full_determinism_ref,
-            args.enable_prefix_caching_ref,
-            args.enforce_eager_ref,
-            max_len,
-            args.gpu_memory_utilization_ref,
-            args.vllm_enable_sleep_ref,
-            LLMRayActor,
-            args.agent_func_path_ref,
-            shared_pg=reference_group
-        )
     else:
         labeler_vllm_engines = None
         policy_vllm_engines = None
@@ -128,7 +112,7 @@ def train(args):
         reference_model_group=reference_group,
         labeler_vllm_engines=labeler_vllm_engines,
         policy_vllm_engines=policy_vllm_engines,
-        reference_vllm_engines=reference_vllm_engines,
+        reference_vllm_engines=None,
     )
     
     # Start training
