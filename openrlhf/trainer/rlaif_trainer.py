@@ -57,47 +57,6 @@ class RLAIFTrainer:
             if self.strategy.args.vllm_enable_sleep:
                 batch_vllm_engine_call(self.policy_vllm_engines, "sleep")
 
-    def _generate_with_vllm(self, vllm_engines, prompts, max_new_tokens=128, temperature=0.0, do_sample=False):
-        """Generate text using vLLM engines for better performance"""
-        if vllm_engines is None:
-            # Fallback to Ray actors if no vLLM engines
-            return None
-            
-        from vllm import SamplingParams
-        
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=1.0,
-            top_k=-1,
-            max_tokens=max_new_tokens,
-            min_tokens=1,
-            skip_special_tokens=False,
-        )
-        
-        # Distribute prompts across vLLM engines
-        refs = []
-        batch_size = (len(prompts) + len(vllm_engines) - 1) // len(vllm_engines)
-        
-        for i, engine in enumerate(vllm_engines):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, len(prompts))
-            batch_prompts = prompts[start_idx:end_idx]
-            
-            if batch_prompts:
-                refs.append(engine.generate.remote(
-                    sampling_params=sampling_params,
-                    prompts=batch_prompts
-                ))
-        
-        # Collect results
-        results = []
-        for ref in refs:
-            outputs = ray.get(ref)
-            for output in outputs:
-                results.append(output.outputs[0].text)
-        
-        return results
-
     def _data_process_fn(self, item):
         processor = AutoProcessor(self.target_pretrain_name, trust_remote_code=True)
         processed = processor(
@@ -105,7 +64,7 @@ class RLAIFTrainer:
             text=item['question'],
             return_tensor="pt",
             padding="max_lenght",
-            max_length=512,
+            max_length=self.args.max_len,
             truncation=True
         )
 
@@ -235,7 +194,7 @@ class RLAIFTrainer:
             batch_size=self.args.train_batch_size,
             sampler=train_sampler,
             collate_fn=default_data_collator,
-            num_workers=4,
+            num_workers=self.args.num_workers,
             pin_memory=True
         )
         
@@ -255,7 +214,6 @@ class RLAIFTrainer:
             # Step 1: Generate candidate responses using policy model group
             # Use policy model group's multiple actors for parallel generation
             # Each actor will generate n_candidates responses for their assigned questions
-            n_candidates = 5  # 每个问题生成的候选回答数量
             
             futures = self.policy_model_group.async_run_method_batch(
                 method_name='forward',
@@ -264,19 +222,19 @@ class RLAIFTrainer:
                 questions=batch['question'],
                 item_indexes=batch['idx'],
                 pixel_values=batch.get('pixel_values', None),
-                n_candidates=n_candidates,
-                max_new_tokens=128,
-                temperature=0.7,
-                do_sample=True,
+                n_candidates=self.args.n_candidates,
+                max_new_tokens=self.args.max_new_tokens,
+                temperature=self.args.policy_generate_temperature,
+                do_sample=self.args.do_sample,
             )
             results = list(itertools.chain.from_iterable(ray.get(futures)))
             
             # Step 2: Labeler processing - strictly reuse LabelerModelActor methods
-            # Divide step: extract facts from question-candidate_response pairs
+            # Dvide step: extract facts from question-candidate_response pairs
             simple_declarative_sentences_sub_batches = self.labeler_model_group.async_run_method_batch(
                 method_name='divide',
                 q_candidate_a=results,
-                max_new_tokens=128,
+                max_new_tokens=self.args.max_new_tokens,
                 temperature=0.0,
                 do_sample=False
             )
@@ -287,7 +245,7 @@ class RLAIFTrainer:
             respons_to_simple_questions_sub_batches = self.labeler_model_group.async_run_method_batch(
                 method_name='conquer',
                 q_facts_batch=simple_declarative_sentences,
-                max_new_tokens=128,
+                max_new_tokens=self.args.max_new_tokens,
                 temperature=0.0,
                 do_sample=False
             )
@@ -299,7 +257,7 @@ class RLAIFTrainer:
                 method_name='YesNo',
                 batch=respons_to_simple_questions,
                 dataset=self.idx2data,
-                max_new_tokens=8,
+                max_new_tokens=3,
                 temperature=0.0,
                 do_sample=False
             )

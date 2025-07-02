@@ -412,11 +412,11 @@ class LabelerModelActor(BaseModelActor):
         self._setup_distributed(strategy)   # TODO：只推理的模型不需要用deepspeed封装
         model_labeler = Actor(
             pretrain,
-            use_flash_attention_2=strategy.args.flash_attn,
+            use_flash_attention_2=strategy.args.flash_attn_labeler,
             bf16=strategy.args.labeler_bf16,
             load_in_8bit=strategy.args.labeler_load_in_8bit,
             ds_config=strategy.get_ds_eval_config(offload=strategy.args.ref_reward_offload),
-            packing_samples=strategy.args.packing_samples,
+            # packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,
             use_liger_kernel=strategy.args.use_liger_kernel,
         )
