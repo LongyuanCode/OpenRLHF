@@ -165,7 +165,7 @@ class RLAIFTrainer:
         for i in range(len(contexts)):
             # 取对应样本的target部分logits
             target_start = input_ids.shape[1] - target_ids.shape[1]
-            target_logits = logits[i, target_start:, :]
+            target_logits = logits[i, target_start - 1:, :]
             target_tokens = target_ids[i, :]
             
             # 计算logp
