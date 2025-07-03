@@ -81,7 +81,7 @@ class DDPOTrainer:
         else:
             self.tb_writer = None
 
-    def concatenated_forward(self, model, chosen_ids, c_mask, reject_ids, r_mask):
+    def concatenated_forward(self, pixel_values, model, chosen_ids, c_mask, reject_ids, r_mask):
         # 与 OpenRLHF 原版一样，合并 chosen/rejected 一次性前向
         def pad_to_length(tensor, length, pad_value, dim=-1):
             if tensor.size(dim) >= length:
@@ -106,7 +106,10 @@ class DDPOTrainer:
             pad_to_length(r_mask, max_len_mask, 0)
         ], dim=0)
 
+        pixel_values = torch.cat([pixel_values, pixel_values], dim=0)
+
         outputs = model(
+            pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attn_mask,
             return_dict=True,
@@ -133,6 +136,7 @@ class DDPOTrainer:
                 self.train_loader.sampler.set_epoch(epoch)
             loop = tqdm(self.train_loader, desc=f"Epoch {epoch} (rank {dist.get_rank()})")
             for batch in loop:
+                pixel_values = batch["pixel_values"].to(torch.cuda.current_device())
                 chosen_ids = batch["chosen_input_ids"].to(torch.cuda.current_device())
                 c_mask = batch["chosen_attention_mask"].to(torch.cuda.current_device())
                 reject_ids = batch["rejected_input_ids"].to(torch.cuda.current_device())
@@ -143,12 +147,12 @@ class DDPOTrainer:
                 # Forward
                 policy_chosen_logps, policy_rejected_logps, policy_pad_mask, \
                 policy_chosen_ids_padded, policy_reject_ids_padded = self.concatenated_forward(
-                    self.model, chosen_ids, c_mask, reject_ids, r_mask
+                    pixel_values, self.model, chosen_ids, c_mask, reject_ids, r_mask
                 )
                 with torch.no_grad():
                     ref_chosen_logps, ref_rejected_logps, _, \
                     _, _ = self.concatenated_forward(
-                        self.model, chosen_ids, c_mask, reject_ids, r_mask
+                        pixel_values, self.model, chosen_ids, c_mask, reject_ids, r_mask
                     )
                 
                 changed_mask, unchanged_mask = get_changed_unchanged_mask(policy_chosen_ids_padded, policy_reject_ids_padded)
@@ -256,7 +260,7 @@ def main():
             padding="max_length",
             max_length=512,
             truncation=True
-        )['input_ids'][0]
+        )['pixel_values'][0]
             for img, text in zip(examples['image'], examples['text'])]
         
         # 解析JSON字符串并提取文本
@@ -297,6 +301,14 @@ def main():
         remove_columns=raw_datasets["train"].column_names
     )
 
+    def multimodal_collate_fn(batch):
+        # 默认的文本部分
+        batch_out = default_data_collator(batch)
+        # 处理 pixel_values
+        if "pixel_values" in batch[0]:
+            batch_out["pixel_values"] = torch.stack([torch.tensor(x["pixel_values"]) if not torch.is_tensor(x["pixel_values"]) else x["pixel_values"] for x in batch])
+        return batch_out
+
     # DataLoader + DistributedSampler
     train_sampler = DistributedSampler(tokenized_datasets["train"], shuffle=True)
     eval_sampler = DistributedSampler(tokenized_datasets["validation"], shuffle=False)
@@ -304,7 +316,7 @@ def main():
         tokenized_datasets["train"],
         batch_size=args.train_batch_size,
         sampler=train_sampler,
-        collate_fn=default_data_collator,
+        collate_fn=multimodal_collate_fn,
         num_workers=4,
         pin_memory=True
     )
