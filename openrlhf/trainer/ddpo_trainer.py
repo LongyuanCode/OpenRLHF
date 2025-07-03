@@ -81,7 +81,7 @@ class DDPOTrainer:
         else:
             self.tb_writer = None
 
-    def concatenated_forward(self, pixel_values, model, chosen_ids, c_mask, reject_ids, r_mask):
+    def concatenated_forward(self, pixel_values, model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens):
         # 与 OpenRLHF 原版一样，合并 chosen/rejected 一次性前向
         def pad_to_length(tensor, length, pad_value, dim=-1):
             if tensor.size(dim) >= length:
@@ -117,14 +117,34 @@ class DDPOTrainer:
             output_attentions=False,
             return_loss=False,
         )
-        # 输出 log-probs: 需要手动从 logits->log_probs
         logits = outputs.logits  # [2*batch_size, seq_len, vocab_size]
-        B2, _, _ = logits.size()
-        B = B2//2
-        shifted_logits = logits[:, :-1, :].contiguous()  # [2*bsz, seq_len-1, vocab_size]
-        shift_mask = attn_mask[:, 1:].contiguous()  # [2*bsz, seq_len-1]
+        B2, seq_len, _ = logits.size()
+        B = B2 // 2
 
-        return shifted_logits[:B], shifted_logits[B:], shift_mask, chosen_ids_padded, reject_ids_padded
+        # prompt_id_lens: [B]，拼接后需要扩展为[2B]
+        prompt_id_lens_2b = torch.cat([prompt_id_lens, prompt_id_lens], dim=0)
+
+        # 对每个样本，先剔除prompt部分，再shift
+        answer_logits, answer_mask, answer_ids = [], [], []
+        for i in range(B2):
+            l = prompt_id_lens_2b[i].item()
+            # shift: logits[:, :-1, :] 对应 label[:, 1:]
+            # 回答部分的logits: 从l-1到倒数第二
+            if l-1 < seq_len-1:
+                answer_logits.append(logits[i, l-1:-1, :])  # 第l-1个logit预测的是第l个token。
+                answer_mask.append(attn_mask[i, l:])
+                answer_ids.append(input_ids[i, l:])
+            else:
+                # 如果prompt已经到结尾，补空
+                answer_logits.append(logits[i, 0:0, :])
+                answer_mask.append(attn_mask[i, 0:0])
+                answer_ids.append(input_ids[i, 0:0])
+        # pad_sequence 使 batch 对齐
+        answer_logits = torch.nn.utils.rnn.pad_sequence(answer_logits, batch_first=True, padding_value=0)
+        answer_mask = torch.nn.utils.rnn.pad_sequence(answer_mask, batch_first=True, padding_value=0)
+        answer_ids = torch.nn.utils.rnn.pad_sequence(answer_ids, batch_first=True, padding_value=0)
+
+        return answer_logits[:B], answer_logits[B:], answer_mask, answer_ids[:B], answer_ids[B:]
 
     def train(self):
         self.model.train()
@@ -147,12 +167,12 @@ class DDPOTrainer:
                 # Forward
                 policy_chosen_logps, policy_rejected_logps, policy_pad_mask, \
                 policy_chosen_ids_padded, policy_reject_ids_padded = self.concatenated_forward(
-                    pixel_values, self.model, chosen_ids, c_mask, reject_ids, r_mask
+                    pixel_values, self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
                 )
                 with torch.no_grad():
                     ref_chosen_logps, ref_rejected_logps, _, \
                     _, _ = self.concatenated_forward(
-                        pixel_values, self.model, chosen_ids, c_mask, reject_ids, r_mask
+                        pixel_values, self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
                     )
                 
                 changed_mask, unchanged_mask = get_changed_unchanged_mask(policy_chosen_ids_padded, policy_reject_ids_padded)
