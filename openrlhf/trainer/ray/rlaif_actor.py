@@ -321,11 +321,34 @@ class PolicyModelActor(TargetModelActor):
         
         return results
 
+    def broadcast_to_vllm(self):
+        """
+        同步当前模型权重到所有vllm engine。
+        只在rank 0上执行。
+        """
+        if not hasattr(self, "vllm_engines") or self.vllm_engines is None or torch.distributed.get_rank() != 0:
+            return
+        model = self.model
+        count, num_params = 0, len(list(model.named_parameters()))
+        for name, param in model.named_parameters():
+            count += 1
+            refs = [
+                engine.update_weight.remote(
+                    name,
+                    param.data.cpu().numpy(),
+                    dtype=str(param.dtype),
+                    shape=param.shape,
+                    empty_cache=(count == num_params)
+                )
+                for engine in self.vllm_engines
+            ]
+            ray.get(refs)
+        torch.cuda.empty_cache()
+
 class ReferenceModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, vllm_engines=None):
         self._setup_distributed(strategy)
         args = strategy.args
-        self.vllm_engines = vllm_engines
         # Only inference model, no optimizer/scheduler
         model = Actor(
             pretrain,

@@ -36,8 +36,8 @@ def train(args):
     )
 
     # reference model group
-    bundles_ref = [{"CPU": 1, "GPU_MEN": 12},
-                   {"CPU": 1, "GPU_MEN": 12}]
+    bundles_ref = [{"CPU": 1, "GPU_MEM": 12},
+                   {"CPU": 1, "GPU_MEM": 12}]
     pg_ref = placement_group(bundles_ref, strategy="STRICT_SPREAD")
     reference_group = RayActorGroup(
         num_nodes=args.num_nodes,
@@ -114,7 +114,7 @@ def train(args):
         reference_model_group=reference_group,
         labeler_vllm_engines=labeler_vllm_engines,
         policy_vllm_engines=policy_vllm_engines,
-        reference_vllm_engines=None,
+        reference_vllm_engines=reference_vllm_engines,
     )
     
     # Start training
@@ -157,15 +157,15 @@ if __name__ == "__main__":
     parser.add_argument("--deepcompile", action="store_true", default=False)
     parser.add_argument("--bf16", action="store_true", default=False, help="Enable bfloat16")
     # Vision RLAIF
-    parser.add_argument("--labeler_load_in_8bit", action="stroe_true", default=True, help="Enable 8 bits quantinization for labeler model.")
-    parser.add_argument("--labeler_load_in_4bit", action="stroe_true", default=True, help="Enable 4 bits quantinization for labeler model.")
-    parser.add_argument("--labeler_bf16", action="stroe_true", default=True, help="Enable bfloat16 for labeler model.")
-    parser.add_argument("--policy_load_in_4bit", action="stroe_true", default=False, help="Enable 4 bits quantinization for policy/reference model.")
-    parser.add_argument("--policy_load_in_8bit", action="stroe_true", default=False, help="Enable 8 bits quantinization for policy/reference model.")
-    parser.add_argument("--policy_bf16", action="stroe_true", default=True, help="Enable bfloat16 for policy/reference model.")
-    parser.add_argument("--ref_load_in_4bit", action="stroe_true", default=False, help="Enable 4 bits quantinization for policy/reference model.")
-    parser.add_argument("--ref_load_in_8bit", action="stroe_true", default=False, help="Enable 8 bits quantinization for policy/reference model.")
-    parser.add_argument("--ref_bf16", action="stroe_true", default=True, help="Enable bfloat16 for policy/reference model.")
+    parser.add_argument("--labeler_load_in_8bit", action="store_true", default=True, help="Enable 8 bits quantinization for labeler model.")
+    parser.add_argument("--labeler_load_in_4bit", action="store_true", default=True, help="Enable 4 bits quantinization for labeler model.")
+    parser.add_argument("--labeler_bf16", action="store_true", default=True, help="Enable bfloat16 for labeler model.")
+    parser.add_argument("--policy_load_in_4bit", action="store_true", default=False, help="Enable 4 bits quantinization for policy/reference model.")
+    parser.add_argument("--policy_load_in_8bit", action="store_true", default=False, help="Enable 8 bits quantinization for policy/reference model.")
+    parser.add_argument("--policy_bf16", action="store_true", default=True, help="Enable bfloat16 for policy/reference model.")
+    parser.add_argument("--ref_load_in_4bit", action="store_true", default=False, help="Enable 4 bits quantinization for policy/reference model.")
+    parser.add_argument("--ref_load_in_8bit", action="store_true", default=False, help="Enable 8 bits quantinization for policy/reference model.")
+    parser.add_argument("--ref_bf16", action="store_true", default=True, help="Enable bfloat16 for policy/reference model.")
     parser.add_argument("--use_flash_attn_labeler", action="store_true", default=False, help="Enable FlashAttention2 of labeler model.")
     parser.add_argument("--use_flash_attn_policy", action="store_true", default=False, help="Enable FlashAttention2 of policy model.")
     parser.add_argument("--use_flash_attn_ref", action="store_true", default=False, help="Enable FlashAttention2 of reference model.")
@@ -210,8 +210,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_gpus_per_policy_actor", type=int, default=None, help="Number of GPUs each policy actor.")
     parser.add_argument("--num_gpus_per_labeler_actor", type=int, default=None, help="Number of GPUs each labeler actor.")
     parser.add_argument("--num_gpus_per_ref_actor", type=int, default=None, help="Number of GPUs each ref actor.")
-    parser.add_argument("--num_labeler_vllm_engines", type=int, default=None, help="Number of vllm engines for labeler model, setted 0 to disable vLLM.")
-    parser.add_argument("--num_policy_vllm_engines", type=int, default=None, help="Number of vllm engines for policy model, setted 0 to disable vLLM.")
     parser.add_argument("--num_ref_vllm_engines", type=int, default=None, help="Number of vllm engines for reference model, setted 0 to disable vLLM.")
     parser.add_argument("--vllm_tensor_parallel_size_labeler", type=int, default=1, help="Tensor parallel size of vLLM engine of labeler model for multi-GPU inference.")
     parser.add_argument("--vllm_tensor_parallel_size_policy", type=int, default=1, help="Tensor parallel size of vLLM engine of policy model for multi-GPU inference.")
