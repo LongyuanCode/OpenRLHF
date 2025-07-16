@@ -344,8 +344,8 @@ class RLAIFTrainer:
             self.policy_model_group.async_run_method(method_name="backward_and_optimize", loss=loss_cpu)
             
             # Step 6: Broadcast updated weights to all policy actors (NCCL)
-            if batch_idx % 10 == 0:
-                self.policy_model_group.broadcast_weights()
+            self.policy_model_group.broadcast_weights()
+            self._broadcast_to_vllm()  # 同步最新权重到vllm engine
             
             # Step 7: Logging and checkpointing
             if batch_idx % 100 == 0:
