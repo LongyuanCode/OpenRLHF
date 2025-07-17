@@ -18,6 +18,7 @@ import numpy as np
 from torchvision import transforms
 import base64
 import io
+from functools import partial
 
 @ray.remote
 class RLAIFTrainer:
@@ -39,6 +40,9 @@ class RLAIFTrainer:
         self.labeler_model_group = labeler_model_group
         self.policy_model_group = policy_model_group
         self.reference_model_group = reference_model_group
+        self.labeler_image_processor = ray.get(self.labeler_model_group._actor_handlers[0].get_image_processor())
+        self.policy_image_processor = ray.get(self.policy_model_group._actor_handlers[0].get_image_processor())
+        self.reference_image_processor = ray.get(self.reference_model_group._actor_handlers[0].get_image_processor())
         
         # vLLM engines for optimized inference
         self.labeler_vllm_engines = labeler_vllm_engines
@@ -63,7 +67,7 @@ class RLAIFTrainer:
             if self.strategy.args.vllm_enable_sleep:
                 batch_vllm_engine_call(self.policy_vllm_engines, "sleep")
 
-    def _data_process_fn(self, item):
+    def _data_process_fn(self, item, policy_image_processor, labeler_image_processor):
         image = item['image']
         # 如果是 torch.Tensor
         if isinstance(image, torch.Tensor):
@@ -86,9 +90,18 @@ class RLAIFTrainer:
         else:
             raise ValueError(f"Unsupported image type: {type(image)}")
 
-        processor = AutoProcessor(self.target_pretrain_name, trust_remote_code=True)
-        processed = processor(
-            images=image,
+        # policy/reference处理
+        processed = policy_image_processor(
+            images=item['image'],
+            text=item['question'],
+            return_tensors="pt",
+            padding="max_length",
+            max_length=self.args.max_len,
+            truncation=True
+        )
+        # labeler处理
+        labeler_processed = labeler_image_processor(
+            images=item['image'],
             text=item['question'],
             return_tensors="pt",
             padding="max_length",
@@ -100,6 +113,7 @@ class RLAIFTrainer:
             "input_ids": processed["input_ids"].squeeze(0),  # [seq_len]
             "attention_mask": processed["attention_mask"].squeeze(0),
             "pixel_values": processed["pixel_values"].squeeze(0),  # [3, H, W]
+            "labeler_pixel_values": labeler_processed["pixel_values"].squeeze(0),
             "question": item["question"],
             "idx": item["idx"]
         }
@@ -113,7 +127,11 @@ class RLAIFTrainer:
 
         # 处理每个样本
         processed_dataset = dataset.map(
-            self._data_process_fn,
+            partial(
+                self._data_process_fn,
+                policy_image_processor=self.policy_image_processor,
+                labeler_image_processor=self.labeler_image_processor
+            ),
             batched=False,  # 每次处理一个样本
             remove_columns=dataset.column_names
         )
@@ -150,155 +168,161 @@ class RLAIFTrainer:
         self.policy_model_group.async_run_method(method_name="set_eval")
 
         for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Training")):
-            # Step 1: Generate candidate responses using policy model group
-            # Use policy model group's multiple actors for parallel generation
-            # Each actor will generate n_candidates responses for their assigned questions
-            
-            futures = self.policy_model_group.async_run_method_batch(
-                method_name='forward',
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                questions=batch['question'],
-                item_indexes=batch['idx'],
-                pixel_values=batch.get('pixel_values', None),
-                n_candidates=self.args.n_candidates,
-                max_new_tokens=self.args.max_new_tokens,
-                temperature=self.args.policy_generate_temperature,
-                do_sample=self.args.do_sample,
-            )
-            results = list(itertools.chain.from_iterable(safe_ray_get(futures, desc="policy_model_group.forward")))
-            
-            # Step 2: Labeler processing - strictly reuse LabelerModelActor methods
-            # Dvide step: extract facts from question-candidate_response pairs
-            simple_declarative_sentences_sub_batches = self.labeler_model_group.async_run_method_batch(
-                method_name='divide',
-                q_candidate_a=results,
-                max_new_tokens=self.args.max_new_tokens,
-                temperature=0.0,
-                do_sample=False
-            )
-            simple_declarative_sentences = \
-                list(itertools.chain.from_iterable(safe_ray_get(simple_declarative_sentences_sub_batches, desc="labeler_model_group.divide")))
-            
-            # Conquer step: convert facts to simple yes/no questions
-            respons_to_simple_questions_sub_batches = self.labeler_model_group.async_run_method_batch(
-                method_name='conquer',
-                q_facts_batch=simple_declarative_sentences,
-                max_new_tokens=self.args.max_new_tokens,
-                temperature=0.0,
-                do_sample=False
-            )
-            respons_to_simple_questions = \
-                list(itertools.chain.from_iterable(safe_ray_get(respons_to_simple_questions_sub_batches, desc="labeler_model_group.conquer")))
-            
-            # YesNo step: answer simple questions with yes/no
-            yesno_results_sub_batches = self.labeler_model_group.async_run_method_batch(
-                method_name='YesNo',
-                batch=respons_to_simple_questions,
-                dataset=self.idx2data,
-                max_new_tokens=3,
-                temperature=0.0,
-                do_sample=False
-            )
-            yesno_results = list(itertools.chain.from_iterable(safe_ray_get(yesno_results_sub_batches, desc="labeler_model_group.yesno")))
-
-            # Combine step: select preferred/inferior response pairs
-            prefer_inferior_response_sub_batches = \
-                self.labeler_model_group.async_run_method_batch(
-                    method_name='combine',
-                    batch=yesno_results,
-                    seed=42
-                )
-            prefer_inferior_response = \
-                list(itertools.chain.from_iterable(ray.get(prefer_inferior_response_sub_batches)))
-            
-            # Step 3: Set policy model to train mode for DPO training
-            self.policy_model_group.async_run_method(method_name="set_train")
-
-            # Step 4: DPO loss calculation and training
-            dpo_loss_fn = DPOLoss(beta=1.0)
-            
-            # Collect all sample data
-            contexts = []
-            preferred_targets = []
-            inferior_targets = []
-            images = []
-            
-            for item in prefer_inferior_response:
-                idx = item['idx']
-                question = item['question']
-                preferred = item['1']
-                inferior = item['0']
-                image = self.idx2data.get(str(idx), {}).get('pixel_values', None)
+            try:
+                # Step 1: Generate candidate responses using policy model group
+                # Use policy model group's multiple actors for parallel generation
+                # Each actor will generate n_candidates responses for their assigned questions
                 
-                contexts.append(question)
-                preferred_targets.append(preferred)
-                inferior_targets.append(inferior)
-                images.append(image)
-            
-            # Calculate log probabilities using reference model (no gradients needed)
-            ref_chosen_futures = self.reference_model_group.async_run_method_batch(
-                method_name="batch_logp",
-                contexts=contexts,
-                targets=preferred_targets,
-                images=images,
-                requires_grad=False
-            )
-            ref_rejected_futures = self.reference_model_group.async_run_method_batch(
-                method_name="batch_logp",
-                contexts=contexts,
-                targets=inferior_targets,
-                images=images,
-                requires_grad=False
-            )
-            reference_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(ref_chosen_futures))))
-            reference_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(ref_rejected_futures))))
-            
-            # Calculate policy model log probabilities (with gradients for training)
-            policy_chosen_futures = self.policy_model_group.async_run_method_batch(
-                method_name="batch_logp",
-                contexts=contexts,
-                targets=preferred_targets,
-                images=images,
-                requires_grad=True
-            )
-            policy_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(policy_chosen_futures))))
-            policy_rejected_futures = self.policy_model_group.async_run_method_batch(
-                method_name="batch_logp",
-                contexts=contexts,
-                targets=inferior_targets,
-                images=images,
-                requires_grad=True
-            )
-            policy_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(policy_rejected_futures))))
-            
-            assert policy_chosen_logps.shape == policy_rejected_logps.shape == reference_chosen_logps.shape == reference_rejected_logps.shape, \
-            f"Shape mismatch: policy_chosen_logps {policy_chosen_logps.shape},\
-                policy_rejected_logps {policy_rejected_logps.shape},\
-                reference_chosen_logps {reference_chosen_logps.shape},\
-                reference_rejected_logps {reference_rejected_logps.shape}"
-            # Calculate DPO loss
-            loss, _, _ = dpo_loss_fn(
-                policy_chosen_logps,
-                policy_rejected_logps,
-                reference_chosen_logps,
-                reference_rejected_logps
-            )
-            
-            # Step 5: Backward pass and optimization using DeepSpeed
-            # This will be handled by the policy model group's master actor
-            # Convert loss to CPU and detach for serialization
-            loss_cpu = loss.detach().cpu()
-            self.policy_model_group.async_run_method(method_name="backward_and_optimize", loss=loss_cpu)
-            
-            # Step 6: Broadcast updated weights to all policy actors (NCCL)
-            self.policy_model_group.broadcast_weights()
-            self._broadcast_to_vllm()  # 同步最新权重到vllm engine
-            
-            # Step 7: Logging and checkpointing
-            if batch_idx % 100 == 0:
-                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
-                self.save_logs_and_checkpoints()
+                futures = self.policy_model_group.async_run_method_batch(
+                    method_name='forward',
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    questions=batch['question'],
+                    item_indexes=batch['idx'],
+                    pixel_values=batch.get('pixel_values', None),
+                    n_candidates=self.args.n_candidates,
+                    max_new_tokens=self.args.max_new_tokens,
+                    temperature=self.args.policy_generate_temperature,
+                    do_sample=self.args.do_sample,
+                )
+                results = list(itertools.chain.from_iterable(safe_ray_get(futures, desc="policy_model_group.forward")))
+                
+                # Step 2: Labeler processing - strictly reuse LabelerModelActor methods
+                # Dvide step: extract facts from question-candidate_response pairs
+                simple_declarative_sentences_sub_batches = self.labeler_model_group.async_run_method_batch(
+                    method_name='divide',
+                    q_candidate_a=results,
+                    max_new_tokens=self.args.max_new_tokens,
+                    temperature=0.0,
+                    do_sample=False
+                )
+                simple_declarative_sentences = \
+                    list(itertools.chain.from_iterable(safe_ray_get(simple_declarative_sentences_sub_batches, desc="labeler_model_group.divide")))
+                
+                # Conquer step: convert facts to simple yes/no questions
+                respons_to_simple_questions_sub_batches = self.labeler_model_group.async_run_method_batch(
+                    method_name='conquer',
+                    q_facts_batch=simple_declarative_sentences,
+                    max_new_tokens=self.args.max_new_tokens,
+                    temperature=0.0,
+                    do_sample=False
+                )
+                respons_to_simple_questions = \
+                    list(itertools.chain.from_iterable(safe_ray_get(respons_to_simple_questions_sub_batches, desc="labeler_model_group.conquer")))
+                
+                # YesNo step: answer simple questions with yes/no
+                yesno_results_sub_batches = self.labeler_model_group.async_run_method_batch(
+                    method_name='YesNo',
+                    batch=respons_to_simple_questions,
+                    dataset=self.idx2data,
+                    max_new_tokens=3,
+                    temperature=0.0,
+                    do_sample=False
+                )
+                yesno_results = list(itertools.chain.from_iterable(safe_ray_get(yesno_results_sub_batches, desc="labeler_model_group.yesno")))
+
+                # Combine step: select preferred/inferior response pairs
+                prefer_inferior_response_sub_batches = \
+                    self.labeler_model_group.async_run_method_batch(
+                        method_name='combine',
+                        batch=yesno_results,
+                        seed=42
+                    )
+                prefer_inferior_response = \
+                    list(itertools.chain.from_iterable(safe_ray_get(prefer_inferior_response_sub_batches, desc="labeler_model_group.combine")))
+                
+                # Step 3: Set policy model to train mode for DPO training
+                self.policy_model_group.async_run_method(method_name="set_train")
+
+                # Step 4: DPO loss calculation and training
+                dpo_loss_fn = DPOLoss(beta=1.0)
+                
+                # Collect all sample data
+                contexts = []
+                preferred_targets = []
+                inferior_targets = []
+                images = []
+                
+                for item in prefer_inferior_response:
+                    idx = item['idx']
+                    question = item['question']
+                    preferred = item['1']
+                    inferior = item['0']
+                    image = self.idx2data.get(str(idx), {}).get('pixel_values', None)
+                    
+                    contexts.append(question)
+                    preferred_targets.append(preferred)
+                    inferior_targets.append(inferior)
+                    images.append(image)
+                
+                # Calculate log probabilities using reference model (no gradients needed)
+                ref_chosen_futures = self.reference_model_group.async_run_method_batch(
+                    method_name="batch_logp",
+                    contexts=contexts,
+                    targets=preferred_targets,
+                    images=images,
+                    requires_grad=False
+                )
+                reference_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(safe_ray_get(ref_chosen_futures, desc="reference_model_group.batch_logp chosen"))))
+
+                ref_rejected_futures = self.reference_model_group.async_run_method_batch(
+                    method_name="batch_logp",
+                    contexts=contexts,
+                    targets=inferior_targets,
+                    images=images,
+                    requires_grad=False
+                )
+                reference_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(safe_ray_get(ref_rejected_futures, desc="reference_model_group.batch_logp reject"))))
+                
+                # Calculate policy model log probabilities (with gradients for training)
+                policy_chosen_futures = self.policy_model_group.async_run_method_batch(
+                    method_name="batch_logp",
+                    contexts=contexts,
+                    targets=preferred_targets,
+                    images=images,
+                    requires_grad=True
+                )
+                policy_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(safe_ray_get(policy_chosen_futures, desc="policy_model_group.batch_logp chosen"))))
+                policy_rejected_futures = self.policy_model_group.async_run_method_batch(
+                    method_name="batch_logp",
+                    contexts=contexts,
+                    targets=inferior_targets,
+                    images=images,
+                    requires_grad=True
+                )
+                policy_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(safe_ray_get(policy_rejected_futures, desc="policy_model_group.batch_logp reject"))))
+                
+                assert policy_chosen_logps.shape == policy_rejected_logps.shape == reference_chosen_logps.shape == reference_rejected_logps.shape, \
+                f"Shape mismatch: policy_chosen_logps {policy_chosen_logps.shape},\
+                    policy_rejected_logps {policy_rejected_logps.shape},\
+                    reference_chosen_logps {reference_chosen_logps.shape},\
+                    reference_rejected_logps {reference_rejected_logps.shape}"
+                # Calculate DPO loss
+                loss, _, _ = dpo_loss_fn(
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    reference_chosen_logps,
+                    reference_rejected_logps
+                )
+                
+                # Step 5: Backward pass and optimization using DeepSpeed
+                # This will be handled by the policy model group's master actor
+                # Convert loss to CPU and detach for serialization
+                loss_cpu = loss.detach().cpu()
+                self.policy_model_group.async_run_method(method_name="backward_and_optimize", loss=loss_cpu)
+                
+                # Step 6: Broadcast updated weights to all policy actors (NCCL)
+                self.policy_model_group.broadcast_weights()
+                self._broadcast_to_vllm()  # 同步最新权重到vllm engine
+                
+                # Step 7: Logging and checkpointing
+                if batch_idx % 100 == 0:
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                    self.save_logs_and_checkpoints()
+            except Exception as e:
+                import traceback
+                print(f"[Error] Exception occurred at batch {batch_idx}: {e}")
+                traceback.print_exc()
             
             
             
