@@ -3,6 +3,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
+import traceback
 
 
 def get_strategy(args):
@@ -74,3 +75,12 @@ def remove_pad_token(input_ids: torch.Tensor, attention_mask: torch.Tensor):
         # Fix for both left and right padding
         no_padding_batch.append((ids[mask.bool()]))
     return no_padding_batch
+
+def safe_ray_get(ray_refs: List, desc=""):
+    import ray
+    try:
+        return ray.get(ray_refs)
+    except Exception as e:
+        print(f"[RayError] Exception in ray.get({desc}): {e}")
+        traceback.print_exc()
+        raise
