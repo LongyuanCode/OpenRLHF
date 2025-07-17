@@ -5,7 +5,7 @@ from transformers.trainer import get_scheduler
 import ray
 
 from .launcher import BaseModelActor
-from openrlhf.models import Actor
+from openrlhf.models import VisionActor
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 
 from typing import Dict
@@ -20,7 +20,6 @@ class TargetModelActor(BaseModelActor):
         group 内所有 actor 都需执行本方法。
         master actor 训练后，调用 RayActorGroup.broadcast_weights()，所有 worker actor 自动同步。
         """
-        import torch
         from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync
         try:
             import deepspeed
@@ -251,7 +250,7 @@ class PolicyModelActor(TargetModelActor):
         self.vllm_engines = vllm_engines
         
         # Create model for training (with DeepSpeed support)
-        model = Actor(
+        model = VisionActor(
             pretrain,
             use_flash_attention_2=strategy.args.use_flash_attn_policy,
             bf16=strategy.args.target_bf16,
@@ -413,7 +412,7 @@ class ReferenceModelActor(TargetModelActor):
         self._setup_distributed(strategy)
         args = strategy.args
         # Only inference model, no optimizer/scheduler
-        model = Actor(
+        model = VisionActor(
             pretrain,
             use_flash_attention_2=args.use_flash_attn_ref,
             bf16=args.ref_bf16,
@@ -435,7 +434,7 @@ class ReferenceModelActor(TargetModelActor):
 class LabelerModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
         self._setup_distributed(strategy)   # TODO：只推理的模型不需要用deepspeed封装
-        model_labeler = Actor(
+        model_labeler = VisionActor(
             pretrain,
             use_flash_attention_2=strategy.args.flash_attn_labeler,
             bf16=strategy.args.labeler_bf16,
@@ -667,8 +666,10 @@ class LabelerModelActor(BaseModelActor):
         for item in batch:
             idx = item["idx"]
             question = item["question"]
-            # 直接用字典查找图片
-            image = dataset.get(str(idx), {}).get("image", None) if dataset is not None else None
+            image = None
+            if dataset is not None:
+                data_entry = dataset.get(str(idx), {})
+                image = data_entry["labeler_pixel_values"]
             candidates = []
             for cand in item["candidates"]:
                 candidate_response = cand["candidate_response"]

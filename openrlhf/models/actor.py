@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoImageProcessor, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
 from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
@@ -214,3 +214,90 @@ class Actor(nn.Module):
 
     def print_trainable_parameters(self):
         self.model.print_trainable_parameters()
+
+class VisionActor(nn.Module):
+    def __init__(
+        self,
+        model_name_or_path,
+        trust_remote_code=True,
+        use_flash_attention_2=False,
+        bf16=True,
+        load_in_4bit=False,
+        lora_rank=0,
+        lora_alpha=16,
+        lora_dropout=0,
+        target_modules=None,
+        device_map=None,
+        **kwargs,
+    ):
+        super().__init__()
+        # 1. 自动加载tokenizer和image_processor
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        try:
+            self.image_processor = AutoImageProcessor.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        except Exception:
+            self.image_processor = None
+
+        # 2. 加载多模态模型
+        attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+        model_kwargs = dict(
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation,
+            torch_dtype=torch.bfloat16 if bf16 else "auto",
+            device_map=device_map,
+        )
+        model_kwargs.update(kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+
+        # 3. LoRA
+        if lora_rank > 0:
+            self.model.enable_input_require_grads()
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+            )
+            self.model = get_peft_model(self.model, lora_config)
+            # LoRA权重精度适配
+            for name, module in self.model.named_modules():
+                if isinstance(module, LoraLayer):
+                    module = module.to(torch.bfloat16)
+                if "norm" in name:
+                    module = module.to(torch.float32)
+                if "lm_head" in name or "embed_tokens" in name:
+                    if hasattr(module, "weight"):
+                        module = module.to(torch.bfloat16)
+
+        # 4. 其它设置
+        if hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = False
+    
+    def get_image_processor(self):
+        return self.image_processor
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        pixel_values=None,
+        images=None,
+        labels=None,
+        **kwargs,
+    ):
+        # 兼容不同模型的输入
+        model_inputs = {}
+        if input_ids is not None:
+            model_inputs["input_ids"] = input_ids
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+        if pixel_values is not None:
+            model_inputs["pixel_values"] = pixel_values
+        if images is not None:
+            model_inputs["images"] = images
+        if labels is not None:
+            model_inputs["labels"] = labels
+        model_inputs.update(kwargs)
+        return self.model(**model_inputs)
