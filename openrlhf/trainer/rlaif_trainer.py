@@ -2,7 +2,7 @@ import ray
 import itertools
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.trainer.ray.launcher import RayActorGroup
-from openrlhf.utils.utils import get_tokenizer
+from openrlhf.utils import get_tokenizer, safe_ray_get
 from datasets import load_dataset
 from transformers import (
     AutoProcessor,
@@ -12,6 +12,12 @@ from openrlhf.utils.distributed_sampler import DistributedSampler
 from torch.utils.data import DataLoader
 from openrlhf.models.loss import DPOLoss
 import torch
+from tqdm import tqdm
+from PIL import Image
+import numpy as np
+from torchvision import transforms
+import base64
+import io
 
 @ray.remote
 class RLAIFTrainer:
@@ -39,8 +45,8 @@ class RLAIFTrainer:
         self.policy_vllm_engines = policy_vllm_engines
         self.reference_vllm_engines = reference_vllm_engines
         
-        self.labeler_tokenizer = get_tokenizer(labeler_pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenzier)
-        self.target_tokenizer = get_tokenizer(target_pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenzier)
+        self.labeler_tokenizer = get_tokenizer(labeler_pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
+        self.target_tokenizer = get_tokenizer(target_pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
         self.target_pretrain_name = target_pretrain
         self.labeler_pretrain_name = labeler_pretrain
     
@@ -58,12 +64,34 @@ class RLAIFTrainer:
                 batch_vllm_engine_call(self.policy_vllm_engines, "sleep")
 
     def _data_process_fn(self, item):
+        image = item['image']
+        # 如果是 torch.Tensor
+        if isinstance(image, torch.Tensor):
+            image = transforms.ToPILImage()(image)
+        # 如果是 numpy array
+        elif isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        # 如果是 base64 字符串
+        elif isinstance(image, str):
+            if image.strip().startswith('data:image'):
+                # base64编码的图片
+                image_data = image.split(',')[1]
+                image = Image.open(io.BytesIO(base64.b64decode(image_data)))
+            else:
+                # 假定是图片路径
+                image = Image.open(image)
+        # 如果已经是 PIL Image，直接用
+        elif isinstance(image, Image.Image):
+            pass
+        else:
+            raise ValueError(f"Unsupported image type: {type(image)}")
+
         processor = AutoProcessor(self.target_pretrain_name, trust_remote_code=True)
         processed = processor(
-            images=item['image'],
+            images=image,
             text=item['question'],
-            return_tensor="pt",
-            padding="max_lenght",
+            return_tensors="pt",
+            padding="max_length",
             max_length=self.args.max_len,
             truncation=True
         )
@@ -94,95 +122,6 @@ class RLAIFTrainer:
         self.idx2data = {str(item["idx"]): item for item in processed_dataset}
         return processed_dataset
 
-    def get_logp_batch(self, model, contexts, targets, images=None, requires_grad=True):
-        """
-        批量计算logp，支持多个样本同时推理
-        Args:
-            model: 模型
-            contexts: List[str], 上下文列表
-            targets: List[str], 目标文本列表
-            images: List, 图片列表
-            requires_grad: bool, 是否需要梯度
-        Returns:
-            torch.Tensor: 每个样本的logp
-        """
-        # 构造batch输入
-        prompts = []
-        target_lengths = []
-        for context, target in zip(contexts, targets):
-            prompt = context
-            prompts.append(prompt)
-            target_lengths.append(len(self.target_tokenizer.encode(target)))
-        
-        # 批量编码
-        input_ids = self.target_tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.target_tokenizer.model_max_length
-        ).input_ids
-        
-        target_ids = self.target_tokenizer(
-            targets,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.target_tokenizer.model_max_length
-        ).input_ids
-        
-        # 拼接context+target
-        input_ids = torch.cat([input_ids, target_ids], dim=1)
-        attention_mask = torch.ones_like(input_ids)
-        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # 处理图片
-        if images is not None and any(img is not None for img in images):
-            # 这里需要根据你的图片处理逻辑调整
-            # 假设images是PIL Image列表，需要转换为tensor
-            pixel_values = []
-            for img in images:
-                if img is not None:
-                    # 根据你的图片预处理逻辑处理
-                    pixel_values.append(img)
-                else:
-                    # 处理空图片的情况
-                    pixel_values.append(torch.zeros(3, 224, 224))  # 示例尺寸
-            pixel_values = torch.stack(pixel_values)
-            model_inputs["pixel_values"] = pixel_values
-        
-        # 前向推理
-        if requires_grad:
-            outputs = model(**model_inputs)
-        else:
-            with torch.no_grad():
-                outputs = model(**model_inputs)
-        
-        logits = outputs.logits  # (batch, seq_len, vocab_size)
-        
-        # 计算每个样本的logp
-        batch_logps = []
-        for i in range(len(contexts)):
-            # 取对应样本的target部分logits
-            target_start = input_ids.shape[1] - target_ids.shape[1]
-            target_logits = logits[i, target_start - 1:, :]
-            target_tokens = target_ids[i, :]
-            
-            # 计算logp
-            log_probs = torch.log_softmax(target_logits, dim=-1)
-            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
-            
-            # 只计算非padding token的logp
-            mask = target_tokens != self.target_tokenizer.pad_token_id
-            sample_logp = (target_logp * mask.float()).sum()
-            
-            if not requires_grad:
-                sample_logp = sample_logp.detach()
-            
-            batch_logps.append(sample_logp)
-        
-        return torch.stack(batch_logps)
-
     def save_logs_and_checkpoints(self):
         pass
 
@@ -210,7 +149,7 @@ class RLAIFTrainer:
         # Set policy model to eval mode for generation
         self.policy_model_group.async_run_method(method_name="set_eval")
 
-        for batch_idx, batch in enumerate(train_dataloader):
+        for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Training")):
             # Step 1: Generate candidate responses using policy model group
             # Use policy model group's multiple actors for parallel generation
             # Each actor will generate n_candidates responses for their assigned questions
@@ -227,7 +166,7 @@ class RLAIFTrainer:
                 temperature=self.args.policy_generate_temperature,
                 do_sample=self.args.do_sample,
             )
-            results = list(itertools.chain.from_iterable(ray.get(futures)))
+            results = list(itertools.chain.from_iterable(safe_ray_get(futures, desc="policy_model_group.forward")))
             
             # Step 2: Labeler processing - strictly reuse LabelerModelActor methods
             # Dvide step: extract facts from question-candidate_response pairs
@@ -239,7 +178,7 @@ class RLAIFTrainer:
                 do_sample=False
             )
             simple_declarative_sentences = \
-                list(itertools.chain.from_iterable(ray.get(simple_declarative_sentences_sub_batches)))
+                list(itertools.chain.from_iterable(safe_ray_get(simple_declarative_sentences_sub_batches, desc="labeler_model_group.divide")))
             
             # Conquer step: convert facts to simple yes/no questions
             respons_to_simple_questions_sub_batches = self.labeler_model_group.async_run_method_batch(
@@ -250,7 +189,7 @@ class RLAIFTrainer:
                 do_sample=False
             )
             respons_to_simple_questions = \
-                list(itertools.chain.from_iterable(ray.get(respons_to_simple_questions_sub_batches)))
+                list(itertools.chain.from_iterable(safe_ray_get(respons_to_simple_questions_sub_batches, desc="labeler_model_group.conquer")))
             
             # YesNo step: answer simple questions with yes/no
             yesno_results_sub_batches = self.labeler_model_group.async_run_method_batch(
@@ -261,13 +200,14 @@ class RLAIFTrainer:
                 temperature=0.0,
                 do_sample=False
             )
-            yesno_results = list(itertools.chain.from_iterable(ray.get(yesno_results_sub_batches)))
+            yesno_results = list(itertools.chain.from_iterable(safe_ray_get(yesno_results_sub_batches, desc="labeler_model_group.yesno")))
 
             # Combine step: select preferred/inferior response pairs
             prefer_inferior_response_sub_batches = \
                 self.labeler_model_group.async_run_method_batch(
                     method_name='combine',
-                    batch=yesno_results
+                    batch=yesno_results,
+                    seed=42
                 )
             prefer_inferior_response = \
                 list(itertools.chain.from_iterable(ray.get(prefer_inferior_response_sub_batches)))
@@ -297,38 +237,46 @@ class RLAIFTrainer:
                 images.append(image)
             
             # Calculate log probabilities using reference model (no gradients needed)
-            # 使用Ray分布式并行logp计算
             ref_chosen_futures = self.reference_model_group.async_run_method_batch(
                 method_name="batch_logp",
                 contexts=contexts,
                 targets=preferred_targets,
-                images=images
+                images=images,
+                requires_grad=False
             )
             ref_rejected_futures = self.reference_model_group.async_run_method_batch(
                 method_name="batch_logp",
                 contexts=contexts,
                 targets=inferior_targets,
-                images=images
+                images=images,
+                requires_grad=False
             )
             reference_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(ref_chosen_futures))))
             reference_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(ref_rejected_futures))))
             
             # Calculate policy model log probabilities (with gradients for training)
-            policy_chosen_logps = self.get_logp_batch(
-                self.policy_model_group.master.model, 
-                contexts, 
-                preferred_targets, 
-                images, 
+            policy_chosen_futures = self.policy_model_group.async_run_method_batch(
+                method_name="batch_logp",
+                contexts=contexts,
+                targets=preferred_targets,
+                images=images,
                 requires_grad=True
             )
-            policy_rejected_logps = self.get_logp_batch(
-                self.policy_model_group.master.model, 
-                contexts, 
-                inferior_targets, 
-                images, 
+            policy_chosen_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(policy_chosen_futures))))
+            policy_rejected_futures = self.policy_model_group.async_run_method_batch(
+                method_name="batch_logp",
+                contexts=contexts,
+                targets=inferior_targets,
+                images=images,
                 requires_grad=True
             )
+            policy_rejected_logps = torch.tensor(list(itertools.chain.from_iterable(ray.get(policy_rejected_futures))))
             
+            assert policy_chosen_logps.shape == policy_rejected_logps.shape == reference_chosen_logps.shape == reference_rejected_logps.shape, \
+            f"Shape mismatch: policy_chosen_logps {policy_chosen_logps.shape},\
+                policy_rejected_logps {policy_rejected_logps.shape},\
+                reference_chosen_logps {reference_chosen_logps.shape},\
+                reference_rejected_logps {reference_rejected_logps.shape}"
             # Calculate DPO loss
             loss, _, _ = dpo_loss_fn(
                 policy_chosen_logps,

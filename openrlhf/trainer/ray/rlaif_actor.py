@@ -4,7 +4,7 @@ import math
 from transformers.trainer import get_scheduler
 import ray
 
-from launcher import BaseModelActor
+from .launcher import BaseModelActor
 from openrlhf.models import Actor
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 
@@ -47,67 +47,13 @@ class TargetModelActor(BaseModelActor):
         self.sync_weights()
     
     def _generate_with_vllm_engines(self, questions, item_indexes, pixel_values, n_candidates, **gen_kwargs):
-        """使用vLLM engine进行生成，支持多模态（图片+文本）和纯文本"""
-        from vllm import SamplingParams
+        from vllm import SamplingParams     # or AsyncLLMEngine if needed
         from torchvision import transforms
         to_pil = transforms.ToPILImage()
 
         batch_size = len(questions)
         all_candidates = [[] for _ in range(batch_size)]
         has_images = pixel_values is not None and len(pixel_values) > 0
-
-        if has_images:
-            # 多模态：图片+问题
-            prompts = []
-            multi_modal_data_list = []
-            for i, question in enumerate(questions):
-                prompt = f"USER: <image>\n{question}\nASSISTANT:"
-                prompts.append(prompt)
-                image_tensor = pixel_values[i]
-                image_pil = to_pil(image_tensor)
-                multi_modal_data_list.append({"image": image_pil})
-
-            sampling_params = SamplingParams(
-                temperature=gen_kwargs.get('temperature', 0.7),
-                top_p=gen_kwargs.get('top_p', 0.9),
-                top_k=-1,
-                max_tokens=gen_kwargs.get('max_new_tokens', 128),
-                min_tokens=1,
-                skip_special_tokens=False,
-            )
-
-            # 对每个问题采样 n_candidates 次，每次不同seed
-            for seed in range(n_candidates):
-                sampling_params.seed = seed
-                refs = []
-                engine_batch_size = (len(prompts) + len(self.vllm_engines) - 1) // len(self.vllm_engines)
-                for i, engine in enumerate(self.vllm_engines):
-                    start_idx = i * engine_batch_size
-                    end_idx = min((i + 1) * engine_batch_size, len(prompts))
-                    batch_prompts = prompts[start_idx:end_idx]
-                    batch_multi_modal_data = multi_modal_data_list[start_idx:end_idx]
-                    if batch_prompts:
-                        refs.append(engine.generate_multimodal.remote(
-                            batch_prompts,
-                            sampling_params,
-                            batch_multi_modal_data
-                        ))
-                responses = []
-                for ref in refs:
-                    outputs = ray.get(ref)
-                    for output in outputs:
-                        responses.append(output.outputs[0].text)
-                for i in range(batch_size):
-                    if i < len(responses):
-                        all_candidates[i].append(responses[i])
-            return all_candidates
-
-        # 纯文本模式（兼容原有逻辑）
-        prompts = []
-        for question in questions:
-            for _ in range(n_candidates):
-                prompt = f"Question: {question}\nAnswer:"
-                prompts.append(prompt)
 
         sampling_params = SamplingParams(
             temperature=gen_kwargs.get('temperature', 0.7),
@@ -118,29 +64,74 @@ class TargetModelActor(BaseModelActor):
             skip_special_tokens=False,
         )
 
+        if has_images:
+            # Prepare multimodal prompts
+            prompts_input = []
+            for i, question in enumerate(questions):
+                prompt = f"USER: <image>\n{question}\nASSISTANT:"
+                img = to_pil(pixel_values[i])
+                for seed in range(n_candidates):
+                    sd = sampling_params.clone()
+                    sd.seed = seed
+                    prompts_input.append({
+                        "prompt": prompt,
+                        "multi_modal_data": {"image": img},
+                        "sampling_params": sd
+                    })
+
+            # Distribute across engines
+            per_engine = (len(prompts_input) + len(self.vllm_engines) - 1) // len(self.vllm_engines)
+            refs = []
+            for i, engine in enumerate(self.vllm_engines):
+                chunk = prompts_input[i * per_engine:(i + 1) * per_engine]
+                if chunk:
+                    refs.append(engine.generate.remote(chunk))
+
+            # Collect and assign responses
+            outputs = []
+            for ref in refs:
+                out = ray.get(ref)
+                for o in out:
+                    outputs.append(o.outputs[0].text)
+
+            # Map back to batches
+            idx = 0
+            for i in range(batch_size):
+                for _ in range(n_candidates):
+                    if idx < len(outputs):
+                        all_candidates[i].append(outputs[idx])
+                    idx += 1
+            return all_candidates
+
+        # Text‑only fallback
+        prompts = []
+        for question in questions:
+            for _ in range(n_candidates):
+                prompts.append({
+                    "prompt": f"Question: {question}\nAnswer:",
+                    "sampling_params": sampling_params.clone()
+                })
+
+        per_engine = (len(prompts) + len(self.vllm_engines) - 1) // len(self.vllm_engines)
         refs = []
-        batch_size_per_engine = (len(prompts) + len(self.vllm_engines) - 1) // len(self.vllm_engines)
         for i, engine in enumerate(self.vllm_engines):
-            start_idx = i * batch_size_per_engine
-            end_idx = min((i + 1) * batch_size_per_engine, len(prompts))
-            batch_prompts = prompts[start_idx:end_idx]
-            if batch_prompts:
-                refs.append(engine.generate.remote(
-                    sampling_params=sampling_params,
-                    prompts=batch_prompts
-                ))
-        all_responses = []
+            chunk = prompts[i * per_engine:(i + 1) * per_engine]
+            if chunk:
+                refs.append(engine.generate.remote(chunk))
+
+        outputs = []
         for ref in refs:
-            outputs = ray.get(ref)
-            for output in outputs:
-                all_responses.append(output.outputs[0].text)
-        batch_size = len(questions)
-        all_candidates = [[] for _ in range(batch_size)]
+            out = ray.get(ref)
+            for o in out:
+                outputs.append(o.outputs[0].text)
+
+        # Remap
+        idx = 0
         for i in range(batch_size):
-            start_idx = i * n_candidates
-            end_idx = start_idx + n_candidates
-            all_candidates[i] = all_responses[start_idx:end_idx]
-        return all_candidates
+            for _ in range(n_candidates):
+                all_candidates[i].append(outputs[idx] if idx < len(outputs) else "")
+                idx += 1
+        return all_candidates    
     
     def _generate_with_model(self, input_ids, attention_mask, pixel_values, n_candidates, **gen_kwargs):
         """使用模型直接生成"""
@@ -178,6 +169,78 @@ class TargetModelActor(BaseModelActor):
                     all_candidates[i].append(generated_text)
         
         return all_candidates
+
+    def batch_logp(self, contexts, targets, images=None, requires_grad=True):
+        """
+        Efficient batch logp calculation for DPO, supports images (optional).
+        Args:
+            contexts: List[str], context prompts
+            targets: List[str], target completions
+            images: List[Tensor or None], optional images
+            requires_grad: bool, whether to compute gradients
+        Returns:
+            List[float]: logp for each sample
+        """
+        prompts = [context for context in contexts]
+        prompt_enc = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length
+        )
+        target_enc = self.tokenizer(
+            targets,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length
+        )
+        input_ids = torch.cat([prompt_enc.input_ids, target_enc.input_ids], dim=1)
+        attention_mask = torch.cat([prompt_enc.attention_mask, target_enc.attention_mask], dim=1)
+        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
+        if images is not None and any(img is not None for img in images):
+            pixel_values = []
+            for img in images:
+                if img is not None:
+                    pixel_values.append(img)
+                else:
+                    pixel_values.append(torch.zeros(3, 224, 224))
+            pixel_values = torch.stack(pixel_values)
+            model_inputs["pixel_values"] = pixel_values
+        device = next(self.model.parameters()).device
+        for k, v in model_inputs.items():
+            if isinstance(v, torch.Tensor):
+                model_inputs[k] = v.to(device)
+        if requires_grad:
+            outputs = self.model(**model_inputs)
+        else:
+            with torch.no_grad():
+                outputs = self.model(**model_inputs)
+        logits = outputs.logits
+        batch_logps = []
+        for i in range(len(contexts)):
+            prompt_len = prompt_enc.input_ids.shape[1]
+            target_len = target_enc.input_ids.shape[1]
+            # logits[t] 预测 input_ids[t+1]，所以target的第t个token由logits[prompt_len-1 + t]预测
+            # 取出target部分的logits（预测target的token）
+            # 假设prompt和target padding后、拼接后的为：[<pad>, <pad>, 101, 102, 103, <pad>, <pad>, <pad>, 201, 202]
+            # target的最后一个202由201对应的logit预测，所以是prompt_len - 1 + target_len - 1
+            # 
+            target_logits = logits[i, prompt_len - 1 : prompt_len - 1 + target_len - 1, :]
+            target_tokens = target_enc.input_ids[i, 1:]  # 去掉第一个token（通常是BOS或pad）
+            log_probs = torch.log_softmax(target_logits, dim=-1)
+            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
+            mask = target_tokens != self.tokenizer.pad_token_id
+            # 如果tokennize后存在BOS，还需要将BOS掩蔽掉。
+            if hasattr(self.tokenizer, "bos_token_id") and self.tokenizer.bos_token_id is not None:
+                mask &= (target_tokens != self.tokenizer.bos_token_id)
+            sample_logp = (target_logp * mask.float()).sum()
+            if not requires_grad:
+                sample_logp = sample_logp.detach().cpu()
+            batch_logps.append(sample_logp)
+
+        return batch_logps
 
 class PolicyModelActor(TargetModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
@@ -345,7 +408,7 @@ class PolicyModelActor(TargetModelActor):
             ray.get(refs)
         torch.cuda.empty_cache()
 
-class ReferenceModelActor(BaseModelActor):
+class ReferenceModelActor(TargetModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, vllm_engines=None):
         self._setup_distributed(strategy)
         args = strategy.args
@@ -368,67 +431,6 @@ class ReferenceModelActor(BaseModelActor):
             strategy,
             use_fast=not args.disable_fast_tokenizer
         )
-
-    def batch_logp(self, contexts, targets, images=None):
-        """
-        Efficient batch logp calculation for DPO, supports images (optional).
-        Args:
-            contexts: List[str], context prompts
-            targets: List[str], target completions
-            images: List[Tensor or None], optional images
-        Returns:
-            List[float]: logp for each sample
-        """
-        import torch
-        prompts = []
-        target_lengths = []
-        for context, target in zip(contexts, targets):
-            prompts.append(context)
-            target_lengths.append(len(self.tokenizer.encode(target)))
-        input_ids = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length
-        ).input_ids
-        target_ids = self.tokenizer(
-            targets,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length
-        ).input_ids
-        input_ids = torch.cat([input_ids, target_ids], dim=1)
-        attention_mask = torch.ones_like(input_ids)
-        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
-        if images is not None and any(img is not None for img in images):
-            pixel_values = []
-            for img in images:
-                if img is not None:
-                    pixel_values.append(img)
-                else:
-                    pixel_values.append(torch.zeros(3, 224, 224))
-            pixel_values = torch.stack(pixel_values)
-            model_inputs["pixel_values"] = pixel_values
-        device = next(self.model.parameters()).device
-        for k, v in model_inputs.items():
-            if isinstance(v, torch.Tensor):
-                model_inputs[k] = v.to(device)
-        with torch.no_grad():
-            outputs = self.model(**model_inputs)
-        logits = outputs.logits
-        batch_logps = []
-        for i in range(len(contexts)):
-            target_start = input_ids.shape[1] - target_ids.shape[1]
-            target_logits = logits[i, target_start:, :]
-            target_tokens = target_ids[i, :]
-            log_probs = torch.log_softmax(target_logits, dim=-1)
-            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
-            mask = target_tokens != self.tokenizer.pad_token_id
-            sample_logp = (target_logp * mask.float()).sum()
-            batch_logps.append(sample_logp.detach().cpu())
-        return batch_logps
 
 class LabelerModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
@@ -713,7 +715,8 @@ class LabelerModelActor(BaseModelActor):
         
     def combine(
         self,
-        batch: list[Dict]
+        batch: list[Dict],
+        seed: int = None
     ) -> list[Dict]:
         """
         输入：
@@ -722,6 +725,8 @@ class LabelerModelActor(BaseModelActor):
         输出：
             List[Dict]，优劣回答对的列表，每个元素是一个字典{"1": preffered response, "0": inferior response}
         """
+        if seed is not None:
+            random.seed(seed)
         results = []
         for item in batch:
             candidates = item['candidates']

@@ -63,8 +63,7 @@ def train(args):
     )
 
     if (args.num_labeler_vllm_engines is not None and args.num_labeler_vllm_engines > 0) and\
-       (args.num_policy_vllm_engines is not None and args.num_policy_vllm_engines > 0) and\
-       (args.num_ref_vllm_engines is not None and args.num_ref_vllm_engines > 0):
+       (args.num_policy_vllm_engines is not None and args.num_policy_vllm_engines > 0):
         max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
         from openrlhf.trainer.ray.vllm_engine import LLMRayActor
         # ref: https://docs.vllm.ai/en/v0.7.2/api/offline_inference/llm.html
@@ -75,12 +74,12 @@ def train(args):
             args.seed_labeler,
             args.full_determinism_labeler,
             args.enable_prefix_caching_labeler,
-            args.enforce_eager_labeler_labeler,
+            args.enforce_eager_labeler,
             max_len,
             args.gpu_memory_utilization_labeler,   # 估算为33GB，冗余配给3GB = 36/48
             args.vllm_enable_sleep_labeler,
             LLMRayActor,
-            shared_pg=labeler_group,
+            shared_pg=pg_labeler,
         )
 
         policy_vllm_engines = create_vllm_engines(
@@ -90,12 +89,12 @@ def train(args):
             args.seed_policy,
             args.full_determinism_policy,
             args.enable_prefix_caching_policy,
-            args.enforce_eager_labeler_policy,
+            args.enforce_eager_policy,
             max_len,
             args.gpu_memory_utilization_policy,   # 2 * (估算推理12GB、训练20GB)/48
             args.vllm_enable_sleep_policy,
             LLMRayActor,
-            shared_pg=policy_group,
+            shared_pg=pg_policy,
         )
     else:
         labeler_vllm_engines = None
