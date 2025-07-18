@@ -228,6 +228,8 @@ class VisionActor(nn.Module):
         lora_dropout=0,
         target_modules=None,
         device_map=None,
+        freeze_vision_tower=True,
+        vision_tower_attr="vision_tower",
         **kwargs,
     ):
         super().__init__()
@@ -248,6 +250,13 @@ class VisionActor(nn.Module):
         )
         model_kwargs.update(kwargs)
         self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+
+        # 冻结视觉模块
+        if freeze_vision_tower:
+            vision_tower = getattr(self.model, vision_tower_attr, None)
+            if vision_tower is not None:
+                for param in vision_tower.parameters():
+                    param.requires_grad = False
 
         # 3. LoRA
         if lora_rank > 0:
