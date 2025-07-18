@@ -214,6 +214,8 @@ if __name__ == "__main__":
     parser.add_argument("--vllm_tensor_parallel_size_policy", type=int, default=1, help="Tensor parallel size of vLLM engine of policy model for multi-GPU inference.")
     parser.add_argument("--vllm_tensor_parallel_size_ref", type=int, default=1, help="Tensor parallel size of vLLM engine of reference model for multi-GPU inference.")
     parser.add_argument("--enable_prefix_caching_labeler", action="store_true", default=False, help="Enable prefix caching for labeler model.")
+    parser.add_argument("--freeze_vision_tower", action="store_true", default=True, help="Whether to freeze vision tower.")
+    parser.add_argument("--vision_tower_name", type=str, default="vision_tower", help="Name of vision tower of model to be post-trained.")
 
     args = parser.parse_args()
     train(args)

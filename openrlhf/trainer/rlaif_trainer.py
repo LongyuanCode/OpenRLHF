@@ -164,15 +164,15 @@ class RLAIFTrainer:
         refs.extend(self.reference_model_group.async_init_model_from_pretrained())
         ray.get(refs)
 
-        # Set policy model to eval mode for generation
-        self.policy_model_group.async_run_method(method_name="set_eval")
-
         for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Training")):
             try:
                 # Step 1: Generate candidate responses using policy model group
                 # Use policy model group's multiple actors for parallel generation
                 # Each actor will generate n_candidates responses for their assigned questions
-                
+
+                # Set policy model to eval mode for generation
+                self.policy_model_group.async_run_method(method_name="set_eval")
+
                 futures = self.policy_model_group.async_run_method_batch(
                     method_name='forward',
                     input_ids=batch['input_ids'],
@@ -308,6 +308,7 @@ class RLAIFTrainer:
                 # Step 5: Backward pass and optimization using DeepSpeed
                 # This will be handled by the policy model group's master actor
                 # Convert loss to CPU and detach for serialization
+                self.policy_model_group.async_run_method(method_name="set_train")
                 loss_cpu = loss.detach().cpu()
                 self.policy_model_group.async_run_method(method_name="backward_and_optimize", loss=loss_cpu)
                 
@@ -323,6 +324,3 @@ class RLAIFTrainer:
                 import traceback
                 print(f"[Error] Exception occurred at batch {batch_idx}: {e}")
                 traceback.print_exc()
-            
-            
-            
