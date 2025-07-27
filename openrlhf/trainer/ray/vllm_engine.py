@@ -68,7 +68,6 @@ class BaseLLMRayActor:
             os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 
-@ray.remote
 class LLMRayActor(BaseLLMRayActor):
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         super().__init__(*args, bundle_indices=bundle_indices, **kwargs)
@@ -115,19 +114,6 @@ class LLMRayActor(BaseLLMRayActor):
         """
         return self.response_queues.get()
 
-    def generate_multimodal(self, prompts, sampling_params, multi_modal_data):
-        """
-        支持多模态（图片+文本）推理的接口。
-        prompts: List[str]
-        multi_modal_data: List[dict]，每个dict如 {"image": PIL.Image}
-        """
-        outputs = self.llm.generate(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            multi_modal_data=multi_modal_data
-        )
-        return outputs
-
 
 def create_vllm_engines(
     num_engines: int,
@@ -144,6 +130,8 @@ def create_vllm_engines(
     llm_actor_cls=LLMRayActor,
     logprobs_mode=None,
     agent_func_path=None,
+    quantization=None,
+    quantization_param_path=None,
 ):
     import vllm
     from packaging import version
@@ -176,38 +164,48 @@ def create_vllm_engines(
             placement_group_bundle_index=bundle_indices[0] if bundle_indices else i,
         )
 
-        additional_kwargs = {}
+        # Choose appropriate dtype based on quantization
+        # For GPTQ models, float16 is typically more compatible than bfloat16
+        dtype = "float16" if quantization == "gptq" else "bfloat16"
+        
+        # Prepare kwargs for vLLM engine creation
+        engine_kwargs = {
+            "model": pretrain,
+            "enforce_eager": enforce_eager,
+            "worker_extension_cls": "openrlhf.trainer.ray.vllm_worker_wrap.WorkerWrap",
+            "tensor_parallel_size": tensor_parallel_size,
+            "seed": seed + i,
+            "distributed_executor_backend": distributed_executor_backend,
+            "max_model_len": max_model_len,
+            "enable_prefix_caching": enable_prefix_caching,
+            "dtype": dtype,
+            "trust_remote_code": True,
+            "full_determinism": full_determinism,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "bundle_indices": bundle_indices,
+            "num_gpus": 0.2 if use_hybrid_engine else 1,
+            "enable_sleep_mode": vllm_enable_sleep,
+            "agent_func_path": agent_func_path,
+        }
         if logprobs_mode:
-            additional_kwargs["logprobs_mode"] = logprobs_mode
-            additional_kwargs["max_logprobs"] = 1
+            engine_kwargs.update({"logprobs_mode": logprobs_mode, "max_logprobs": 1})
             assert version.parse(vllm.__version__) > version.parse(
                 "0.10.0"
             ), "vLLM > 0.10.0 is required for logprobs_mode"
+        
+        # Add quantization parameters if specified
+        if quantization is not None:
+            engine_kwargs["quantization"] = quantization
+            
+        if quantization_param_path is not None:
+            engine_kwargs["quantization_param_path"] = quantization_param_path
 
         vllm_engines.append(
-            llm_actor_cls.options(
+            ray.remote(llm_actor_cls).options(
                 num_cpus=num_gpus,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
-            ).remote(
-                model=pretrain,
-                enforce_eager=enforce_eager,
-                worker_extension_cls="openrlhf.trainer.ray.vllm_worker_wrap.WorkerWrap",
-                tensor_parallel_size=tensor_parallel_size,
-                seed=seed + i,
-                distributed_executor_backend=distributed_executor_backend,
-                max_model_len=max_model_len,
-                enable_prefix_caching=enable_prefix_caching,
-                dtype="bfloat16",
-                trust_remote_code=True,
-                full_determinism=full_determinism,
-                gpu_memory_utilization=gpu_memory_utilization,
-                bundle_indices=bundle_indices,
-                num_gpus=0.2 if use_hybrid_engine else 1,
-                enable_sleep_mode=vllm_enable_sleep,
-                agent_func_path=agent_func_path,
-                **additional_kwargs,
-            )
+            ).remote(**engine_kwargs)
         )
 
     if vllm_enable_sleep:

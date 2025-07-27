@@ -497,7 +497,7 @@ class PolicyModelActor(BaseModelActor):
     def fit(self, kl_ctl: float = 0):
         """Train actor model with the replay buffer."""
         torch.cuda.empty_cache()
-        self.actor.train()      # 将模型设置为train()模式，与eval()相对
+        self.actor.train()
         status = self.trainer.ppo_train(kl_ctl)
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()

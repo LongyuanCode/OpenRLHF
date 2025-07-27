@@ -223,6 +223,7 @@ class VisionActor(nn.Module):
         use_flash_attention_2=False,
         bf16=True,
         load_in_4bit=False,
+        load_in_8bit=False,
         lora_rank=0,
         lora_alpha=16,
         lora_dropout=0,
@@ -287,6 +288,9 @@ class VisionActor(nn.Module):
     def get_image_processor(self):
         return self.image_processor
 
+    def get_tokenizer(self):
+        return self.tokenizer
+
     def forward(
         self,
         input_ids=None,
@@ -310,3 +314,94 @@ class VisionActor(nn.Module):
             model_inputs["labels"] = labels
         model_inputs.update(kwargs)
         return self.model(**model_inputs)
+    
+    def batch_logp(self, prefered_inferior_response_list, requires_grad=True):
+        """
+        Batch logp calculation for DPO, supports images (optional),
+        and preserves mapping for each sample. Efficient batch version.
+        Args:
+            prefered_inferior_response_list: List[dict], each dict contains keys:
+                'idx', 'question', '1', '0', 'pixel_values'
+            requires_grad: bool, whether to compute gradients
+        Returns:
+            List[dict]: each dict contains original keys plus 'logp_1', 'logp_0'
+        """
+        # Prepare batch inputs
+        questions = []
+        responses = []
+        pixel_values_list = []
+        for item in prefered_inferior_response_list:
+            questions.append(item["question"])
+            responses.append(item["1"])
+            pixel_values_list.append(item.get("pixel_values", None))
+            questions.append(item["question"])
+            responses.append(item["0"])
+            pixel_values_list.append(item.get("pixel_values", None))
+        # Tokenize all pairs
+        prompt_enc = self.tokenizer(
+            questions,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length
+        )
+        target_enc = self.tokenizer(
+            responses,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length
+        )
+        input_ids = torch.cat([prompt_enc.input_ids, target_enc.input_ids], dim=1)
+        attention_mask = torch.cat([prompt_enc.attention_mask, target_enc.attention_mask], dim=1)
+        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
+        # Handle images if present
+        if any(img is not None for img in pixel_values_list):
+            pixel_values = []
+            for img in pixel_values_list:
+                if img is not None:
+                    pixel_values.append(img)
+                else:
+                    pixel_values.append(torch.zeros(3, 224, 224))
+            pixel_values = torch.stack(pixel_values)
+            model_inputs["pixel_values"] = pixel_values
+        device = next(self.model.parameters()).device
+        for k, v in model_inputs.items():
+            if isinstance(v, torch.Tensor):
+                model_inputs[k] = v.to(device)
+        # Forward pass
+        if requires_grad:
+            outputs = self.model(**model_inputs)
+        else:
+            with torch.no_grad():
+                outputs = self.model(**model_inputs)
+        logits = outputs.logits
+        batch_size = len(prefered_inferior_response_list)
+        logps = []
+        for i in range(batch_size * 2):
+            prompt_len = prompt_enc.input_ids[i].shape[0]
+            target_len = target_enc.input_ids[i].shape[0]
+            # logits[t] 预测 input_ids[t+1]，所以target的第t个token由logits[prompt_len-1 + t]预测
+            # 取出target部分的logits（预测target的token）
+            # 假设prompt和target padding后、拼接后的为：[<pad>, <pad>, 101, 102, 103, <pad>, <pad>, <pad>, 201, 202]
+            # target的最后一个202由201对应的logit预测，所以是prompt_len - 1 + target_len - 1
+            target_logits = logits[i, prompt_len - 1 : prompt_len - 1 + target_len - 1, :]
+            target_tokens = target_enc.input_ids[i, 1:]
+            log_probs = torch.log_softmax(target_logits, dim=-1)
+            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
+            mask = target_tokens != self.tokenizer.pad_token_id
+            if hasattr(self.tokenizer, "bos_token_id") and self.tokenizer.bos_token_id is not None:
+                mask &= (target_tokens != self.tokenizer.bos_token_id)
+            sample_logp = (target_logp * mask.float()).sum()
+            if not requires_grad:
+                sample_logp = sample_logp.detach().cpu()
+            logps.append(sample_logp)
+        # Split back to original mapping
+        results = []
+        for i, item in enumerate(prefered_inferior_response_list):
+            result = dict(item)
+            result["logp_1"] = logps[2 * i]
+            result["logp_0"] = logps[2 * i + 1]
+            results.append(result)
+
+        return results
