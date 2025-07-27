@@ -21,7 +21,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from openrlhf.models import Actor
 from openrlhf.models.ring_attn_utils import get_ring_attn_group, set_ring_attn_group
 from openrlhf.utils.distributed_sampler import DistributedSampler
-from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync
+from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync, torch_dist_cuda_sync_and_barrier
 from .deepspeed_utils import (
     _z3_params_to_fetch,
     get_eval_ds_config,
@@ -398,6 +398,10 @@ class DeepspeedStrategy(ABC):
             model_to_save.config.to_json_file(output_config_file)
             # save tokenizer
             tokenizer.save_pretrained(output_dir)
+            #save image processor
+            img_processor = kwargs.get("img_processor", None)
+            if img_processor is not None:
+                img_processor.save_pretrained(output_dir)
 
         del output_state_dict
         # Explicitly release memory
