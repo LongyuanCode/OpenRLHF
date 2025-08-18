@@ -4,15 +4,15 @@ import random
 import socket
 
 import deepspeed
+import numpy as np
 from typing import Dict, List
 from abc import ABC
 from torch.optim import Optimizer
 from transformers.trainer import get_scheduler
 from torch.utils.data import DataLoader, Dataset
-from transformers import default_data_collator
+from transformers import default_data_collator, AutoProcessor
 import torch
 import ray
-
 from openrlhf.models import VisionActor
 from openrlhf.models.loss import DPOLoss
 from openrlhf.trainer.ray.vllm_engine import LLMRayActor
@@ -22,26 +22,170 @@ from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, r
 from .launcher import BaseModelActor
 from .utils import get_physical_gpu_id
 
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s'
+)
+import json
+import sys
+
+
+class ListDataset(Dataset):
+    """自定义Dataset类，用于处理列表数据"""
+    def __init__(self, data_list: List[dict]):
+        self.data_list = data_list
+    
+    def __len__(self):
+        return len(self.data_list)
+    
+    def __getitem__(self, idx):
+        return self.data_list[idx]
+
 class MultiModalLLMRayActor(LLMRayActor):
     def generate_multimodal(self, prompts, sampling_params, multi_modal_data):
         """
         支持多模态（图片+文本）推理的接口。
         prompts: List[str]
         sampling_params: vllm.SamplingParams 或 list
-        multi_modal_data: List[dict]，每个dict如 {"image": PIL.Image}
+        multi_modal_data: List[dict]，每个dict如 {"image": Tensor}
         """
         # 直接调用vllm.LLM的generate
-        outputs = self.llm.generate(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            multi_modal_data=multi_modal_data
-        )
+        inputs = []
+        for prompt, mm in zip(prompts, multi_modal_data):
+            inputs.append({
+                "prompt": prompt,
+                "multi_modal_data": {"image": mm["image"].unsqueeze(0).contiguous(memory_format=torch.channels_last)},    # Image has to be shape like [b, c, h, w], even when it't one image.
+            })
+        outputs = self.llm.generate(inputs, sampling_params=sampling_params)
         return outputs
     
+    def _apply_chat_template(self, tokenizer, user_text: str) -> str:
+        """
+        使用模型自带的 chat template 格式化 prompt；若不可用则回退到 "USER:"/"ASSISTANT:" 模式。
+        """
+        try:
+            if hasattr(tokenizer, "apply_chat_template"):
+                messages = [{"role": "user", "content": user_text}]
+                return tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+        except Exception:
+            pass
+        # 回退：简单 USER/ASSISTANT 结构
+        return f"USER: {user_text}\nASSISTANT:"
+
+    def _format_chat_prompts(self, tokenizer, prompts: list[str]) -> list[str]:
+        """
+        将一组用户文本包装为模型期望的 Chat 模板；如果模板不可用，则原样返回。
+        """
+        formatted = []
+        use_template = hasattr(tokenizer, "apply_chat_template")
+        for p in prompts:
+            if use_template:
+                try:
+                    messages = [{"role": "user", "content": p}]
+                    chat = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    formatted.append(chat)
+                    continue
+                except Exception:
+                    pass
+            formatted.append(f"USER: {p}\nASSISTANT:")
+        return formatted
+
+    def _safe_max_length(self, tokenizer, fallback: int = 4096) -> int:
+        """
+        从 vLLM 引擎或 tokenizer 推断安全的 max_length，上限做裁剪，避免 fast tokenizer 的 size_t 溢出。
+        """
+        # 1) 优先从 vLLM 引擎配置读取
+        max_len = None
+        try:
+            cfg = self.llm.llm_engine.get_model_config()
+            max_len = getattr(cfg, "max_model_len", None)
+        except Exception:
+            pass
+
+        # 2) 回退到 tokenizer.model_max_length
+        if max_len is None:
+            max_len = getattr(tokenizer, "model_max_length", None)
+
+        # 3) 合理边界检查与回退
+        try:
+            if max_len is None:
+                return fallback
+            max_len = int(max_len)
+        except Exception:
+            return fallback
+
+        # 过滤异常的大值或非正数
+        if max_len <= 0 or max_len > 1000000:
+            return fallback
+        return max_len
+
+    def get_tokenizer(self):
+        """
+        稳定获取与当前 vLLM 引擎一致的 HF tokenizer。
+        1) 优先从 vLLM 的 llm_engine 中获取模型名；
+        2) 回退到 self.llm 或初始化时 kwargs 中的 model；
+        3) 使用 AutoTokenizer 加载，并确保 pad_token 存在。
+        """
+        # 1) 从 vLLM 引擎读取模型名
+        model_name = None
+        try:
+            model_config = self.llm.llm_engine.get_model_config()
+            model_name = getattr(model_config, "model", None)
+        except Exception:
+            pass
+
+        # 2) 回退路径
+        if model_name is None:
+            model_name = getattr(self.llm, "model", None)
+        if model_name is None:
+            model_name = getattr(self, "kwargs", {}).get("model", None)
+        if model_name is None:
+            raise ValueError("无法确定模型名称以加载 tokenizer")
+
+        # 3) 加载 HF tokenizer
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        return tokenizer
+
     def get_image_processor(self):
-        model_config = self.llm.model_executor.model_info.model_config
-        image_processor = ImagePlugin()._get_hf_image_processor(model_config)
-        return image_processor
+        try:
+            # 尝试通过 vLLM 的 LLMEngine 获取模型配置
+            model_config = self.llm.llm_engine.get_model_config()
+            model_name = model_config.model
+        except AttributeError:
+            # 如果上述方法失败，尝试其他方式
+            try:
+                # 通过 engine_args 获取模型名称
+                model_name = getattr(self.llm, 'model', None)
+                if model_name is None:
+                    # 最后的备选方案：从 kwargs 中获取
+                    model_name = self.kwargs.get('model', None)
+            except:
+                raise AttributeError("无法获取模型配置信息")
+        
+        if model_name is None:
+            raise ValueError("无法确定模型名称")
+        
+        # 修复：使用 AutoProcessor 来处理多模态输入（图像+文本）
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_name, 
+                trust_remote_code=True,
+                use_fast=True
+            )
+            return processor
+        except Exception as e:
+            # 如果加载失败，返回 None
+            print(f"警告：无法加载处理器 - {e}")
+            return None
 
 class DataServerActor:
     def __init__(self, ai_feedback: List[Dict]):
@@ -148,15 +292,48 @@ class VisionActorTrainer(ABC):
 
         torch_dist_cuda_sync_and_barrier()
 
-    def setup_dataloader(self, dataset: Dataset, batch_size: int, shuffle: bool = True, 
+    def setup_dataloader(self, dataset, batch_size: int, shuffle: bool = True, 
                         drop_last: bool = True, num_workers: int = 4, pin_memory: bool = True):
+        import torch.distributed as dist
+        
+        # 如果dataset是列表，转换为ListDataset
+        if isinstance(dataset, list):
+            dataset = ListDataset(dataset)
+        
+        # 检查是否在分布式环境中
+        if dist.is_initialized():
+            # 使用DistributedSampler确保每个进程拿到不同的数据
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=shuffle
+            )
+        else:
+            sampler = None
+
+        def data_collate_fn(batch):
+            """
+            自定义的 collate_fn，用于处理包含字典值的数据结构
+            """
+            if not batch:
+                return batch
+            
+            # 如果batch中只有一个样本，直接返回
+            if len(batch) == 1:
+                return batch[0]
+            
+            # 对于多个样本，直接返回列表
+            return batch
+        
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
-            sampler=None,
-            collate_fn=default_data_collator,
+            sampler=sampler,
+            collate_fn=data_collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            drop_last=drop_last,
         )
         
         return dataloader
@@ -178,17 +355,22 @@ class VisionActorTrainer(ABC):
 
     def train_step(self, batch):
         device = torch.cuda.current_device()
-        # 期望batch为dict of list/tensor，需解包
-        # 兼容单条数据
+        # 处理batch数据格式
+        # DataLoader返回的batch可能是单个样本或样本列表
         if isinstance(batch, dict):
+            # 单个样本，转换为列表
             batch = [batch]
+        elif isinstance(batch, (list, tuple)) and len(batch) > 0 and isinstance(batch[0], dict):
+            # 已经是字典列表，直接使用
+            pass
+        else:
+            # 其他格式，尝试转换
+            batch = list(batch) if hasattr(batch, '__iter__') else [batch]
         
         # 从batch中提取reference model的logps
         reference_chosen_logps = torch.stack([item['logp_1'] for item in batch]).to(device)
         reference_rejected_logps = torch.stack([item['logp_0'] for item in batch]).to(device)
 
-        # 直接用batch作为输入，调用batch_logp
-        # batch的每个元素应包含 'idx', 'question', '1', '0', 'pixel_values'
         logp_results = self.vision_actor.batch_logp(batch, requires_grad=True)
         # 分别收集logp_1和logp_0
         policy_chosen_logps = torch.stack([item['logp_1'] for item in logp_results])
@@ -238,7 +420,12 @@ class VisionActorTrainer(ABC):
     def train(self, dataset, batch_size: int, num_epochs: int, 
               shuffle: bool = True, drop_last: bool = True, num_workers: int = 4, 
               pin_memory: bool = True):
-        # 用索引和idx2data构建子数据集
+        """分布式训练方法，使用DistributedSampler确保每个进程拿到不同的数据"""
+        # 设置模型为训练模式
+        self.vision_actor.train()
+        
+        # 用DistributedSampler构建dataloader
+        # 每个逻辑actor（rank）都要有自己的一份Dataset对象，这是PyTorch分布式的常规做法。
         dataloader = self.setup_dataloader(
             dataset=dataset,
             batch_size=batch_size,
@@ -248,8 +435,18 @@ class VisionActorTrainer(ABC):
             pin_memory=pin_memory
         )
         
+        # 打印调试信息
+        if self.strategy.is_rank_0():
+            print(f"Training with {len(dataset)} samples, batch_size={batch_size}, num_epochs={num_epochs}")
+            if hasattr(dataloader.sampler, 'num_replicas'):
+                print(f"DistributedSampler: num_replicas={dataloader.sampler.num_replicas}, rank={dataloader.sampler.rank}")
+        
         training_history = []
         for epoch in range(num_epochs):
+            # 设置epoch，确保每个epoch的数据分布不同
+            if hasattr(dataloader.sampler, 'set_epoch'):
+                dataloader.sampler.set_epoch(epoch)
+            
             # 训练一个 epoch
             epoch_global_losses = self.train_epoch(dataloader, epoch, num_epochs)
             if self.strategy.is_rank_0():
@@ -384,10 +581,11 @@ class PolicyModelActor(BaseModelActor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
     
-    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
+    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None, pixel_values_object_ref=None):
         args = strategy.args 
         self.vllm_engines = vllm_engines
         self.disable_ds_ckpt = args.disable_ds_ckpt
+        self.idx2data = pixel_values_object_ref
 
         if getattr(args, "vllm_num_engines", 0) > 0:
             # To prevent hanging during NCCL synchronization of weights between DeepSpeed and vLLM.
@@ -403,11 +601,10 @@ class PolicyModelActor(BaseModelActor):
             bf16=strategy.args.policy_train_bf16,
             load_in_4bit=strategy.args.policy_train_load_in_4bit,
             load_in_8bit=strategy.args.policy_train_load_in_8bit,
-            ds_config=strategy.get_ds_train_config(is_actor=True),
             temperature=strategy.args.temperature,
-            use_liger_kernel=strategy.args.use_liger_kernel,
             vision_tower_attr=args.vision_tower_name,
-            freeze_vision_tower=args.freeze_vision_tower
+            freeze_vision_tower=args.freeze_vision_tower,
+            idx2pixel_values=self.idx2data
         )
         strategy.print('model actor:\n', model_actor)
         self.actor_image_processor = model_actor.get_image_processor()
@@ -425,10 +622,11 @@ class PolicyModelActor(BaseModelActor):
             scheduler_specific_kwargs={"min_lr": args.actor_learning_rate * 0.1},
         )
 
-        if args.gradient_checkpointing:
-            model_actor.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": args.gradient_checkpointing_use_reentrant}
-            )
+        # TODO: 使能梯度检查点功能。https://deepwiki.com/search/openrlhfmodelsactorpy202gradie_92743e54-e9f2-4ef1-ba4e-6c64efcd0eef
+        # if args.gradient_checkpointing:
+        #     model_actor.gradient_checkpointing_enable(
+        #         gradient_checkpointing_kwargs={"use_reentrant": args.gradient_checkpointing_use_reentrant}
+        #     )
 
         self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare(
             (model_actor, actor_optim, actor_scheduler),
@@ -454,13 +652,18 @@ class PolicyModelActor(BaseModelActor):
             vllm_engines=self.vllm_engines,
         )
 
-    def train_with_dataset(self, dataset, batch_size=8, num_epochs=1, **kwargs):
+    def train_with_dataset(self, dataset, batch_size=8, num_epochs=1, shuffle=True, 
+                          drop_last=True, num_workers=4, pin_memory=True, **kwargs):
         torch.cuda.empty_cache()
         self.actor.train()
         train_history = self.vision_trainer.train(
             dataset=dataset,
             batch_size=batch_size,
             num_epochs=num_epochs,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
             **kwargs
         )
         # empty_cahce() operates at the process level
@@ -537,7 +740,7 @@ class LabelerRayActor(MultiModalLLMRayActor):
         Returns:
             List[Dict]，每个元素包含'question'、'candidate_response'和'facts'字段，'facts'为List[List[str]]，与候选回答一一对应。
         """
-        tokenizer = self.llm.model_executor.model_info.get_tokenizer()
+        tokenizer = self.get_tokenizer()
 
         prompts = []
         mapping = []  # 记录每个prompt属于哪个问题和候选索引
@@ -545,51 +748,52 @@ class LabelerRayActor(MultiModalLLMRayActor):
             q = qa["question"]
             for r_idx, r in enumerate(qa["candidate_response"]):
                 prompt = (
-                    "You are an expert in extracting facts from the given question-answer pair for an image. Your task is to extract and rewrite the facts mentioned in the question-answer pair into self-contained sentences. Exclude opinions or subjective statements.\n\n You should present your result in the following format:\n### Facts:\n- {Extracted fact 1}\n- {Extracted fact 2}\n- ...\n\n### Question-response pair:\nQuestion: " + q + "\nResponse: " + r
+                    "USER: You are an expert in extracting facts from the given question–answer pair for an image."
+                    " Extract and rewrite the facts into self-contained sentences. Exclude opinions.\n\n"
+                    "You should present your result in the following format:\n"
+                    "### Facts:\n- {Extracted fact 1}\n- {Extracted fact 2}\n- ...\n\n"
+                    "### Question-response pair:\n"
+                    f"Question: {q}\n"
+                    f"Response: {r}\n"
+                    "ASSISTANT:\n"
+                    "### Facts:\n"
                 )
                 prompts.append(prompt)
                 mapping.append((q_idx, r_idx))
 
-        # 批量tokenize
-        encoded = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=tokenizer.model_max_length if tokenizer.model_max_length is not None else 1024
-        )
-
-        # 批量生成
-        gen_ids = self.llm.generate(
-            input_ids=encoded.input_ids,
-            attention_mask=encoded.attention_mask,
-            max_new_tokens=max_new_tokens,
+        # vLLM 生成（直接使用字符串 prompts）
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            min_tokens=5,
             temperature=temperature,
-            do_sample=do_sample,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            top_p=0.95,
+            top_k=-1,
+            skip_special_tokens=True,
+            truncate_prompt_tokens=self._safe_max_length(tokenizer),
+            include_stop_str_in_output=False,
+            ignore_eos=False,
         )
+        # 使用对话模板提升生成概率
+        chat_prompts = self._format_chat_prompts(tokenizer, prompts)
+        outputs = self.llm.generate(prompts=chat_prompts, sampling_params=sampling_params)
 
-        # 解码并解析"### Facts:"下的列表项
-        raw_outputs = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-        # 组织成原结构：List[Dict]，每个元素包含question、candidate_response、facts
+        # 解析生成文本
+        raw_outputs = [o.outputs[0].text for o in outputs]
         num_questions = len(q_candidate_a)
         facts_nested: list[list[list[str]]] = [[] for _ in range(num_questions)]
         for (q_idx, r_idx), text in zip(mapping, raw_outputs):
             lines = []
-            in_facts = False
             for line in text.splitlines():
                 ls = line.strip()
-                if ls.startswith("### Facts"):
-                    in_facts = True
-                    continue
-                if in_facts:
-                    if ls.startswith("###"):  # 到下个 section
-                        break
-                    if ls.startswith("-"):
-                        fact = ls.lstrip("- ").rstrip()
-                        if fact:
-                            lines.append(fact)
+                if ls.startswith("-"):
+                    fact = ls.lstrip("- ").rstrip()
+                    if fact:
+                        lines.append(fact)
+                elif ls.startswith("*"):
+                    fact = ls.lstrip("* ").rstrip()
+                    if fact:
+                        lines.append(fact)
             # 确保每个问题有对应的候选列表
             while len(facts_nested[q_idx]) <= r_idx:
                 facts_nested[q_idx].append([])
@@ -625,7 +829,7 @@ class LabelerRayActor(MultiModalLLMRayActor):
         Returns:
             List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...]}
         """
-        tokenizer = self.llm.model_executor.model_info.get_tokenizer()
+        tokenizer = self.get_tokenizer()
 
         prompts = []
         q_cand_pairs = []  # (question, candidate_response) 对应关系
@@ -638,52 +842,53 @@ class LabelerRayActor(MultiModalLLMRayActor):
                     prompts.append("")  # 保证对齐
                 else:
                     content = (
-                        "You are an expert at modifying a given declarative sentence into a general question sentence. Your task is to modify the given declarative sentences one by one into a general question form. Do not change tenses or add extra content.\n    If the given declarative sentence contains not, no or negative meaning words, you need to check the modified general interrogative sentence to make sure that the generated general question sentence retains words with not, no or negative meaning words.\n\nYou should present your result in the following format:\n### Modified sentences:\n- {Modified sentence 1}\n- {Modified sentence 2}\n- ...\n\n### Declarative sentences:"
+                        "USER: You convert each given declarative English sentence into a grammatically correct Yes/No (polar) question. \
+                        Do not change tense, modality, meaning, or add content. Preserve any negation words (not, no, never, etc.). \
+                        Do NOT use wh-words: what, which, who, whom, whose, where, when, why, how. \
+                        Form the question by subject–auxiliary inversion. \
+                        - If the main verb is be, invert be. \
+                        - If there is a modal (can/could/will/would/should/must/may/might), invert the modal. \
+                        - Otherwise insert Do/Does/Did according to tense and number. \
+                        If uncertain, use: \"Is it true that {original sentence}?\" \
+                        Output format only: \
+                        ASSISTANT:\n\
+                        ### Polar questions:"
                     )
                     for fact in facts:
                         content += f"\n- {fact}"
                     prompts.append(content)
                 q_cand_pairs.append((question, cand_response))
 
-        # 2) 批量 tokenize
-        encoded = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=tokenizer.model_max_length if tokenizer.model_max_length is not None else 1024
-        )
-
-        # 3) 生成
-        gen_ids = self.llm.generate(
-            input_ids=encoded.input_ids,
-            attention_mask=encoded.attention_mask,
-            max_new_tokens=max_new_tokens,
+        # 直接用 vLLM 基于字符串 prompts 生成
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            min_tokens=1,
             temperature=temperature,
-            do_sample=do_sample,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            top_p=0.9,
+            top_k=-1,
+            skip_special_tokens=True,
+            truncate_prompt_tokens=self._safe_max_length(tokenizer),
+            include_stop_str_in_output=False,
+            ignore_eos=False,
         )
-
-        # 4) 解码并解析"### Modified sentences:"下的列表项
-        raw_outputs = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        chat_prompts = self._format_chat_prompts(tokenizer, prompts)
+        outputs = self.llm.generate(prompts=chat_prompts, sampling_params=sampling_params)
+        raw_outputs = [o.outputs[0].text for o in outputs]
         # 组装成每个candidate的simple_questions
         cand_simple_questions = []
         for text in raw_outputs:
             lines = []
-            in_mod = False
             for line in text.splitlines():
                 ls = line.strip()
-                if ls.startswith("### Modified sentences"):
-                    in_mod = True
-                    continue
-                if in_mod:
-                    if ls.startswith("###"):  # 到下个 section
-                        break
-                    if ls.startswith("-"):
-                        q = ls.lstrip("- ").rstrip()
-                        if q:
-                            lines.append(q)
+                if ls.startswith("###"):
+                    break
+                if ls.startswith("-"):
+                    q = ls.lstrip("- ").rstrip()
+                if ls.startswith("*"):
+                    q = ls.lstrip("* ").rstrip()
+                if q:
+                    lines.append(q)
             cand_simple_questions.append(lines)
         # 组装最终结构
         result = []
@@ -720,71 +925,98 @@ class LabelerRayActor(MultiModalLLMRayActor):
             batch: List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...]}。
             dataset: idx到样本的字典，通过'idx'查找图片。
         输出：
-            List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...], 'simple_answers': [{'1': Yes/yes logit, '0': No/no logit}]}。
+            List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...], 'simple_answers': [{'1': Yes/yes scores, '0': No/no scores}]}。
         """
-        from torchvision import transforms
-        to_pil = transforms.ToPILImage()
+        pixel_values_dict = self.pixel_values_object_ref
+        tokenizer = self.get_tokenizer()
 
-        pixel_values_dict = ray.get(self.pixel_values_object_ref) if self.pixel_values_object_ref is not None else None
-        tokenizer = self.llm.model_executor.model_info.get_tokenizer()
-        results = []
-        for i, item in enumerate(batch):
-            question = item["question"]
-            image = to_pil(pixel_values_dict[source_idxes[i]]["labeler_pixel_values"])
-            candidates = []
-            for cand in item["candidates"]:
-                candidate_response = cand["candidate_response"]
-                simple_questions = cand["simple_questions"]
-                simple_answers = []
-                for sq in simple_questions:
-                    prompt = sq.strip() + " Please answer Yes or No."
-                    # 构造输入
-                    inputs = tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=tokenizer.model_max_length if tokenizer.model_max_length is not None else 1024
-                    )
-                    # 如果需要图片，假设模型支持pixel_values参数
-                    model_inputs = dict(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask)
-                    if image is not None:
-                        model_inputs["pixel_values"] = image.unsqueeze(0) if hasattr(image, 'unsqueeze') else image
-                    # 推理，获得logits
-                    outputs = self.llm(**model_inputs)
-                    logits = outputs.logits  # (batch, seq_len, vocab_size)
-                    # 取最后一个token的logits
-                    last_logits = logits[0, -1, :]
-                    # 获取"Yes"、"yes"、"No"、"no"的token id
-                    yes_ids = [tokenizer.convert_tokens_to_ids(t) for t in ["Yes", "yes"]]
-                    no_ids = [tokenizer.convert_tokens_to_ids(t) for t in ["No", "no"]]
-                    # 取最大logit
-                    yes_logit = max([last_logits[i].item() for i in yes_ids if i != tokenizer.unk_token_id], default=float('-inf'))
-                    no_logit = max([last_logits[i].item() for i in no_ids if i != tokenizer.unk_token_id], default=float('-inf'))
-                    simple_answers.append({"1": yes_logit, "0": no_logit})
-                candidates.append({
-                    "candidate_response": candidate_response,
-                    "simple_questions": simple_questions,
-                    "simple_answers": simple_answers
-                })
+        # 先构建结果骨架，便于回填
+        results: list[dict] = []
+        for item in batch:
             results.append({
                 "idx": item["idx"],
-                "question": question,
-                "candidates": candidates
+                "question": item["question"],
+                "candidates": [
+                    {
+                        "candidate_response": cand["candidate_response"],
+                        "simple_questions": list(cand.get("simple_questions", [])),
+                        "simple_answers": {"1": 0.0, "0": 0.0}
+                    }
+                    for cand in item["candidates"]
+                ],
             })
+
+        # 将整个 batch 的所有 simple_questions 扁平化，一次性推理
+        from vllm import SamplingParams
+        flat_prompts: list[str] = []
+        flat_sampling_params: list[SamplingParams] = []
+        flat_multi_modal_data: list[dict] = []
+        back_mapping: list[tuple[int, int]] = []  # (item_idx, cand_idx)
+
+        for i, item in enumerate(batch):
+            # 取该样本对应的图像
+            pixel_values_np = pixel_values_dict[source_idxes[i]]["labeler_pixel_values"]
+            if isinstance(pixel_values_np, np.ndarray):
+                pixel_values_np = pixel_values_np.copy()
+                pixel_values_tensor = torch.from_numpy(pixel_values_np)
+            else:
+                pixel_values_tensor = pixel_values_np
+            multi_modal_data = {"image": pixel_values_tensor}
+
+            for j, cand in enumerate(item["candidates"]):
+                simple_questions = cand.get("simple_questions", [])
+                for _sq in simple_questions:
+                    # 仅保留用户内容，由模板函数包裹；保留 <image> 标记
+                    user_text = "<image>\n" + _sq.strip() + " Please answer Yes or No."
+                    flat_prompts.append(user_text)
+                    flat_multi_modal_data.append(multi_modal_data)
+                    flat_sampling_params.append(
+                        SamplingParams(
+                            max_tokens=1,
+                            temperature=temperature,
+                            top_p=0.5,
+                            top_k=-1,
+                            skip_special_tokens=True,
+                            truncate_prompt_tokens=self._safe_max_length(tokenizer),
+                            include_stop_str_in_output=False,
+                            ignore_eos=False,
+                        )
+                    )
+                    back_mapping.append((i, j))
+
+        if flat_prompts:
+            chat_prompts = self._format_chat_prompts(tokenizer, flat_prompts)
+            outputs_raw = self.generate_multimodal(chat_prompts, flat_sampling_params, flat_multi_modal_data)
+            generated_texts = [o.outputs[0].text for o in outputs_raw]
+            print(f"chuanwei YesNo generated_texts: {generated_texts}")
+
+            for (i_idx, j_idx), text in zip(back_mapping, generated_texts):
+                t = (text or "").strip()
+                t_low = t.lower()
+                yes_score = 1.0 if t_low.startswith("yes") else 0.0
+                no_score = 1.0 if t_low.startswith("no") else 0.0
+                results[i_idx]["candidates"][j_idx]["simple_answers"]["1"] += float(yes_score)
+                results[i_idx]["candidates"][j_idx]["simple_answers"]["0"] += float(no_score)
+
         return results
 
     @staticmethod
     def combine(
         batch: list[Dict],
-        seed: int = None
+        seed: int = None,
+        pair_num: int = 2
     ) -> list[Dict]:
         """
         输入：
-            batch: List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...], 'simple_answers': [{'1': Yes/yes logit, '0': No/no logit}]}。
+            batch: List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...], 'simple_answers': [{'1': Yes/yes scores, '0': No/no scores}]}。
 
         输出：
-            List[Dict]，优劣回答对的列表，每个元素是一个字典{"1": preffered response, "0": inferior response}
+            List[Dict]，每个元素形如：
+            {
+                "idx": idx,
+                "question": question,
+                "prefered_inferior_pairs": [{"1": prefered, "0": inferior}, ...]  # 最多 pair_num 对
+            }
         """
         if seed is not None:
             random.seed(seed)
@@ -794,25 +1026,23 @@ class LabelerRayActor(MultiModalLLMRayActor):
             scores = []
             for cand in candidates:
                 simple_answers = cand['simple_answers']
-                num_rejection = 0
-                for yes_no in simple_answers:
-                    if yes_no['0'] > yes_no['1']:
-                        num_rejection -= 1
-                scores.append(num_rejection)
-            # 随机选取两组索引，要求scores[idx1] > scores[idx2]
-            # paper ref: To save the training cost, we randomly sample at most 2 pairs for each instruction 
-            # and we find such a filtering process only causes minor performence drops.
+                scores.append(simple_answers["1"] - simple_answers["0"])
+            # 随机选取不重复的索引对，要求scores[idx1] > scores[idx2]
+            # 注：最多抽取 pair_num 对
             n = len(candidates)
             valid_pairs = [(i, j) for i in range(n) for j in range(n) if i != j and scores[i] > scores[j]]
             if valid_pairs:
-                idx1, idx2 = random.choice(valid_pairs)
-                candidate_response1 = candidates[idx1]['candidate_response']
-                candidate_response2 = candidates[idx2]['candidate_response']
+                k = min(pair_num, len(valid_pairs))
+                selected = random.sample(valid_pairs, k)
+                pairs = []
+                for idx1, idx2 in selected:
+                    prefered = candidates[idx1]['candidate_response']
+                    inferior = candidates[idx2]['candidate_response']
+                    pairs.append({"1": prefered, "0": inferior})
                 results.append({
                     "idx": item["idx"],
                     "question": item["question"],
-                    "1": candidate_response1,
-                    "0": candidate_response2
+                    "prefered_inferior_pairs": pairs
                 })
         return results
 
@@ -823,15 +1053,14 @@ class PolicyRayActor(MultiModalLLMRayActor):
         self.pixel_values_object_ref = pixel_values_object_ref
 
     def set_pixel_values_object_ref(self, pixel_values_object_ref):
+        # 添加调试信息
         self.pixel_values_object_ref = pixel_values_object_ref
 
     def generate_n_candidates(self, questions, item_indexes, n_candidates, **gen_kwargs):
         from vllm import SamplingParams     # or AsyncLLMEngine if needed
         from torchvision import transforms
-        to_pil = transforms.ToPILImage()
 
         batch_size = len(questions)
-        all_candidates = [[] for _ in range(batch_size)]
 
         sampling_params = SamplingParams(
             temperature=gen_kwargs.get('temperature', 0.7),
@@ -842,165 +1071,84 @@ class PolicyRayActor(MultiModalLLMRayActor):
             skip_special_tokens=False,
         )
 
-        # 通过ray object store获取图片特征
-        pixel_values_dict = ray.get(self.pixel_values_object_ref) if self.pixel_values_object_ref is not None else None
+        # 直接使用已经反序列化的数据，不需要再次调用 ray.get()
+        pixel_values_dict = self.pixel_values_object_ref if self.pixel_values_object_ref is not None else None
         has_images = pixel_values_dict is not None
 
         if has_images:
-            # Prepare multimodal prompts
-            prompts_input = []
+            # 直接构建多模态输入列表
+            prompts = []
+            sampling_params_list = []
+            multi_modal_data_list = []
+            
             for i, question in enumerate(questions):
                 prompt = f"USER: <image>\n{question}\nASSISTANT:"
-                img = to_pil(pixel_values_dict[item_indexes[i]]['pixel_values'])
+                pixel_values_np = pixel_values_dict[item_indexes[i]]['pixel_values']
+                if isinstance(pixel_values_np, np.ndarray):
+                    pixel_values_np = pixel_values_np.copy()
+                    pixel_values_tensor = torch.from_numpy(pixel_values_np)
+                else:
+                    pixel_values_tensor = pixel_values_np
+                multi_modal_data = {"image": pixel_values_tensor}
+                
                 for seed in range(n_candidates):
                     sd = sampling_params.clone()
                     sd.seed = seed
-                    prompts_input.append({
-                        "prompt": prompt,
-                        "multi_modal_data": {"image": img},
-                        "sampling_params": sd
-                    })
-
-            # Distribute across engines
-            per_engine = (len(prompts_input) + len(self.vllm_engines) - 1) // len(self.vllm_engines)
-            refs = []
-            for i, engine in enumerate(self.vllm_engines):
-                chunk = prompts_input[i * per_engine:(i + 1) * per_engine]
-                if chunk:
-                    refs.append(engine.generate.remote(chunk))
-
-            # Collect and assign responses
-            outputs = []
-            for ref in refs:
-                out = ray.get(ref)
-                for o in out:
-                    outputs.append(o.outputs[0].text)
+                    
+                    prompts.append(prompt)
+                    sampling_params_list.append(sd)
+                    multi_modal_data_list.append(multi_modal_data)
+            
+            # 直接使用 generate_multimodal 生成
+            outputs_raw = self.generate_multimodal(
+                prompts=prompts,
+                sampling_params=sampling_params_list,
+                multi_modal_data=multi_modal_data_list
+            )
+            
+            # 提取文本输出
+            outputs = [o.outputs[0].text for o in outputs_raw]
 
             # Map back to batches
+            q_candidate_a = [{} for _ in range(batch_size)]
             idx = 0
             for i in range(batch_size):
+                candidates_one_q = []
                 for _ in range(n_candidates):
                     if idx < len(outputs):
-                        all_candidates[i].append(outputs[idx])
+                        candidates_one_q.append(outputs[idx])
                     idx += 1
-            return all_candidates
-
-        # Text‑only fallback
-        prompts = []
-        for question in questions:
-            for _ in range(n_candidates):
-                prompts.append({
-                    "prompt": f"Question: {question}\nAnswer:",
-                    "sampling_params": sampling_params.clone()
-                })
-
-        per_engine = (len(prompts) + len(self.vllm_engines) - 1) // len(self.vllm_engines)
-        refs = []
-        for i, engine in enumerate(self.vllm_engines):
-            chunk = prompts[i * per_engine:(i + 1) * per_engine]
-            if chunk:
-                refs.append(engine.generate.remote(chunk))
-
-        outputs = []
-        for ref in refs:
-            out = ray.get(ref)
-            for o in out:
-                outputs.append(o.outputs[0].text)
-
-        # Remap
-        idx = 0
-        for i in range(batch_size):
-            for _ in range(n_candidates):
-                all_candidates[i].append(outputs[idx] if idx < len(outputs) else "")
-        return all_candidates
-
-
-class ReferenceRayActor(MultiModalLLMRayActor):
-    def batch_logp(self, prefered_inferior_response_list, requires_grad=True):
-        """
-        Batch logp calculation for DPO, supports images (optional),
-        and preserves mapping for each sample. Efficient batch version.
-        Args:
-            prefered_inferior_response_list: List[dict], each dict contains keys:
-                'idx', 'question', '1', '0', 'pixel_values'
-            requires_grad: bool, whether to compute gradients
-        Returns:
-            List[dict]: each dict contains original keys plus 'logp_1', 'logp_0'
-        """
-        tokenizer = self.llm.model_executor.model_info.get_tokenizer()
-        model = self.llm.model_executor.model
-        # Prepare batch inputs
-        questions = []
-        responses = []
-        pixel_values_list = []
-        for item in prefered_inferior_response_list:
-            questions.append(item["question"])
-            responses.append(item["1"])
-            pixel_values_list.append(item.get("pixel_values", None))
-            questions.append(item["question"])
-            responses.append(item["0"])
-            pixel_values_list.append(item.get("pixel_values", None))
-        # Tokenize all pairs
-        prompt_enc = tokenizer(
-            questions,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=tokenizer.model_max_length if tokenizer.model_max_length is not None else 1024
-        )
-        target_enc = tokenizer(
-            responses,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=tokenizer.model_max_length if tokenizer.model_max_length is not None else 1024
-        )
-        input_ids = torch.cat([prompt_enc.input_ids, target_enc.input_ids], dim=1)
-        attention_mask = torch.cat([prompt_enc.attention_mask, target_enc.attention_mask], dim=1)
-        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
-        # Handle images if present
-        if any(img is not None for img in pixel_values_list):
-            pixel_values = []
-            for img in pixel_values_list:
-                if img is not None:
-                    pixel_values.append(img)
-                else:
-                    pixel_values.append(torch.zeros(3, 224, 224))
-            pixel_values = torch.stack(pixel_values)
-            model_inputs["pixel_values"] = pixel_values
-        device = next(model.parameters()).device
-        for k, v in model_inputs.items():
-            if isinstance(v, torch.Tensor):
-                model_inputs[k] = v.to(device)
-        # Forward pass
-        if requires_grad:
-            outputs = model(**model_inputs)
+                q_candidate_a[i].update({"idx": item_indexes[i]})
+                q_candidate_a[i].update({"question": questions[i]})
+                q_candidate_a[i].update({"candidate_response": candidates_one_q})
+            return q_candidate_a
         else:
-            with torch.no_grad():
-                outputs = model(**model_inputs)
-        logits = outputs.logits
-        batch_size = len(prefered_inferior_response_list)
-        logps = []
-        for i in range(batch_size * 2):
-            prompt_len = prompt_enc.input_ids[i].shape[0]
-            target_len = target_enc.input_ids[i].shape[0]
-            target_logits = logits[i, prompt_len - 1 : prompt_len - 1 + target_len - 1, :]
-            target_tokens = target_enc.input_ids[i, 1:]
-            log_probs = torch.log_softmax(target_logits, dim=-1)
-            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
-            mask = target_tokens != tokenizer.pad_token_id
-            if hasattr(tokenizer, "bos_token_id") and tokenizer.bos_token_id is not None:
-                mask &= (target_tokens != tokenizer.bos_token_id)
-            sample_logp = (target_logp * mask.float()).sum()
-            if not requires_grad:
-                sample_logp = sample_logp.detach().cpu()
-            logps.append(sample_logp)
-        # Split back to original mapping
-        results = []
-        for i, item in enumerate(prefered_inferior_response_list):
-            result = dict(item)
-            result["logp_1"] = logps[2 * i]
-            result["logp_0"] = logps[2 * i + 1]
-            results.append(result)
+            logging.warning("chuanwei No images found, returning None")
+            return None
 
-        return results
+    
+class ReferenceModelActor(BaseModelActor):
+    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, pixel_values_object_ref=None):
+        self._setup_distributed(strategy)
+        self.idx2data = pixel_values_object_ref
+        model_actor = VisionActor(
+            pretrain,
+            use_flash_attention_2=strategy.args.use_flash_attn_policy,
+            bf16=strategy.args.policy_train_bf16,
+            load_in_4bit=strategy.args.policy_train_load_in_4bit,
+            load_in_8bit=strategy.args.policy_train_load_in_8bit,
+            temperature=strategy.args.temperature,
+            vision_tower_attr=strategy.args.vision_tower_name,
+            freeze_vision_tower=strategy.args.freeze_vision_tower,
+            idx2pixel_values=self.idx2data
+        )
+        strategy.print(f"Reference model:\n{model_actor}")
+
+        # Replace self.model_actor.model with deepspeed engine and return model_actor.
+        self.model_actor_ds_engine = self.strategy.prepare(model_actor, is_rlhf=False)
+        # 避免在 tp>1 时保留一份未封装模型导致重复显存占用：将底层模型指向 DeepSpeed 引擎
+        self.model_actor_ds_engine.eval()
+
+    def batch_logp(self, prefered_inferior_response_list, requires_grad=False):
+        # 现在 VisionActor 会自己从 idx2pixel_values 获取 pixel_values，直接传递原始数据
+        return self.model_actor_ds_engine.batch_logp(prefered_inferior_response_list, requires_grad)
