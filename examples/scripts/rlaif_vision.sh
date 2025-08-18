@@ -1,26 +1,22 @@
 #!/bin/bash
 #RAY_ADDRESS='http://127.0.0.1:8265' ray job submit --working-dir . -- \
 python openrlhf/cli/rlaif_train_ray.py \
-    --dataset_name "openbmb/RLAIF-V-Dataset" \
+    --dataset_name "OpenBMB/RLAIF-V-Dataset" \
+    --prefered_inferior_pair_num 2 \
     --num_labeler_vllm_engines 2 \
     --num_policy_vllm_engines 2 \
     --enforce_eager_labeler \
     --enforce_eager_policy \
-    --enforce_eager_ref \
-    --gpu_memory_utilization_labeler 0.95 \
+    --gpu_memory_utilization_labeler 0.9 \
     --vllm_enable_sleep_labeler True \
     --enable_prefix_caching_policy False \
-    --gpu_memory_utilization_policy 0.95 \
+    --gpu_memory_utilization_policy 0.9 \
     --vllm_enable_sleep_policy True \
-    --enable_prefix_caching_ref False \
-    --gpu_memory_utilization_ref 0.95 \
-    --vllm_enable_sleep_ref True \
     --enable_prefix_caching_labeler False \
-    --gpu_memory_utilization_labeler 0.95 \
-    --vllm_enable_sleep_labeler True \
     --use_ds_universal_ckpt \
     --zero_stage 2 \
-    --gradient_checkpointing False \
+    --temperature 0.0 \
+    --gradient_checkpointing True \
     --gradient_checkpointing_use_reentrant False \
     --deepcompile False \
     --bf16 True \
@@ -30,19 +26,12 @@ python openrlhf/cli/rlaif_train_ray.py \
     --policy_load_in_4bit False \
     --policy_load_in_8bit False \
     --policy_bf16 True \
-    --ref_load_in_4bit False \
-    --ref_load_in_8bit False \
-    --ref_bf16 True \
     --use_flash_attn_policy True \
-    --pretrain_labeler "llava-hf/llava-1.5-13b-hf" \
+    --pretrain_labeler "/root/gpufree-data/modelscope_cache/models/llava-hf/llava-1.5-13b-hf" \
     --seed_labeler 42 \
-    --full_determinism_labeler True \
-    --pretrain_policy "llava-hf/llava-1.5-7b-hf" \
+    --full_determinism True \
+    --pretrain_policy "/root/gpufree-data/modelscope_cache/models/llava-hf/llava-1.5-7b-hf" \
     --seed_policy 42 \
-    --full_determinism_policy True \
-    --pretrain_ref "llava-hf/llava-1.5-7b-hf" \
-    --seed_ref 42 \
-    --full_determinism_ref True \
     --n_candidates 5 \
     --max_new_tokens 256 \
     --policy_generate_temperature 0.7 \
@@ -50,22 +39,21 @@ python openrlhf/cli/rlaif_train_ray.py \
     --max_len 1024 \
     --prompt_max_len 600 \
     --generate_max_len 256 \
-    --labeler_batch_size 500 \
+    --labeler_batch_size 1 \
     --num_epochs 1 \
     --num_workers 4 \
-    --num_gpus_per_node_policy_group 2 \
-    --num_gpus_per_policy_actor 2 \
+    --num_gpus_per_node 4 \
+    --num_gpus_per_policy_actor 1 \
+    --num_gpus_per_ref_actor 1 \
     --num_nodes 1 \
-    --num_ref_vllm_engines 2 \
     --vllm_tensor_parallel_size_labeler 1 \
     --vllm_tensor_parallel_size_policy 1 \
-    --vllm_tensor_parallel_size_ref 1 \
     --enable_prefix_caching_labeler False \
     --freeze_vision_tower True \
     --vision_tower_name "vision_tower" \
     \
     --actor_learning_rate 1e-5 \
-    --lr_scheduler "cosine" \
+    --lr_scheduler "cosine_with_min_lr" \
     --lr_warmup_ratio 0.1 \
     --adam_betas 0.9 0.999 \
     --l2 0.0 \
@@ -82,7 +70,8 @@ python openrlhf/cli/rlaif_train_ray.py \
     --save_path "./trained_policy_model" \
     \
     --deepspeed_enable_sleep False \
-    --ds_tensor_parallel_size 2 \
+    --ds_tensor_parallel_size_policy 1 \
+    --ds_tensor_parallel_size_ref 1 \
     --ring_attn_size 1 \
     --train_batch_size 2 \
     --micro_train_batch_size 1 \

@@ -1,12 +1,13 @@
 from typing import Optional
 
 import deepspeed
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoImageProcessor, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoConfig, AutoTokenizer, AutoImageProcessor, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
 from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
@@ -231,17 +232,27 @@ class VisionActor(nn.Module):
         device_map=None,
         freeze_vision_tower=True,
         vision_tower_attr="vision_tower",
+        idx2pixel_values=None,
         **kwargs,
     ):
         super().__init__()
         # 1. 自动加载tokenizer和image_processor
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        # 安全设置 tokenizer 的 max_length，避免 OverflowError
+        if not hasattr(self.tokenizer, 'model_max_length') or self.tokenizer.model_max_length is None:
+            self.tokenizer.model_max_length = 4096
+        elif self.tokenizer.model_max_length > 1000000:
+            self.tokenizer.model_max_length = 4096
         try:
-            self.image_processor = AutoImageProcessor.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=True
+            )
         except Exception:
             self.image_processor = None
 
-        # 2. 加载多模态模型
+        # 2. 加载多模态/纯文本模型
         attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
         model_kwargs = dict(
             trust_remote_code=trust_remote_code,
@@ -250,7 +261,19 @@ class VisionActor(nn.Module):
             device_map=device_map,
         )
         model_kwargs.update(kwargs)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+        # 优先尝试以 CausalLM 加载；若遇到多模态配置（如 LlavaConfig）导致不支持，则回退到 Vision2Seq
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+        except ValueError as e:
+            cfg = None
+            try:
+                cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+            except Exception:
+                pass
+            if cfg is not None:
+                self.model = AutoModelForVision2Seq.from_pretrained(model_name_or_path, **model_kwargs)
+            else:
+                raise
 
         # 冻结视觉模块
         if freeze_vision_tower:
@@ -284,6 +307,9 @@ class VisionActor(nn.Module):
         # 4. 其它设置
         if hasattr(self.model.config, "use_cache"):
             self.model.config.use_cache = False
+        
+        # 5. 设置 pixel_values 映射
+        self.idx2pixel_values = idx2pixel_values
     
     def get_image_processor(self):
         return self.image_processor
@@ -313,7 +339,16 @@ class VisionActor(nn.Module):
         if labels is not None:
             model_inputs["labels"] = labels
         model_inputs.update(kwargs)
-        return self.model(**model_inputs)
+        
+        # 避免递归：直接调用底层模型而不是 self.model
+        # 如果 self.model 是 DeepSpeed 引擎，直接调用
+        # 如果 self.model 是原始模型，也直接调用
+        if hasattr(self.model, 'module'):
+            # DeepSpeed 引擎的情况
+            return self.model.module(**model_inputs)
+        else:
+            # 原始模型的情况
+            return self.model(**model_inputs)
     
     def batch_logp(self, prefered_inferior_response_list, requires_grad=True):
         """
@@ -321,7 +356,9 @@ class VisionActor(nn.Module):
         and preserves mapping for each sample. Efficient batch version.
         Args:
             prefered_inferior_response_list: List[dict], each dict contains keys:
-                'idx', 'question', '1', '0', 'pixel_values'
+                'idx', 'question',
+                'prefered_inferior_pairs': [{'1': <prefered>, '0': <inferior>}, {'1': <prefered>, '0': <inferior>}], 
+                'pixel_values'
             requires_grad: bool, whether to compute gradients
         Returns:
             List[dict]: each dict contains original keys plus 'logp_1', 'logp_0'
@@ -331,53 +368,266 @@ class VisionActor(nn.Module):
         responses = []
         pixel_values_list = []
         for item in prefered_inferior_response_list:
+            # 从成员变量获取 pixel_values
+            pixel_values = None
+            if self.idx2pixel_values is not None:
+                idx = item['idx']
+                if idx in self.idx2pixel_values:
+                    pixel_values = self.idx2pixel_values[idx]['pixel_values']
+            
             questions.append(item["question"])
-            responses.append(item["1"])
-            pixel_values_list.append(item.get("pixel_values", None))
+            responses.append(item['prefered_inferior_pairs'][0]['1'])
+            pixel_values_list.append(pixel_values)
             questions.append(item["question"])
-            responses.append(item["0"])
-            pixel_values_list.append(item.get("pixel_values", None))
-        # Tokenize all pairs
-        prompt_enc = self.tokenizer(
-            questions,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length
-        )
-        target_enc = self.tokenizer(
-            responses,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length
-        )
-        input_ids = torch.cat([prompt_enc.input_ids, target_enc.input_ids], dim=1)
-        attention_mask = torch.cat([prompt_enc.attention_mask, target_enc.attention_mask], dim=1)
-        model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
-        # Handle images if present
-        if any(img is not None for img in pixel_values_list):
-            pixel_values = []
-            for img in pixel_values_list:
-                if img is not None:
-                    pixel_values.append(img)
+            responses.append(item['prefered_inferior_pairs'][0]['0'])
+            pixel_values_list.append(pixel_values)
+        
+        # 检查是否有图像输入
+        has_images = any(img is not None for img in pixel_values_list)
+        
+        if has_images and self.image_processor is not None:
+            # 使用图像处理器处理多模态输入
+            all_texts = []
+            all_images = []
+            
+            print(f"[DEBUG] Starting multimodal processing with {len(questions)} samples")
+            print(f"[DEBUG] Image processor type: {type(self.image_processor)}")
+            print(f"[DEBUG] Tokenizer type: {type(self.tokenizer)}")
+            print(f"[DEBUG] Tokenizer image token: {getattr(self.tokenizer, 'image_token', 'N/A')}")
+            print(f"[DEBUG] Tokenizer image_token_id: {getattr(self.tokenizer, 'image_token_id', 'N/A')}")
+            
+            for i, (question, response, pixel_values) in enumerate(zip(questions, responses, pixel_values_list)):
+                # 构建多模态输入文本 - 使用正确的图像占位符格式
+                # 对于 LLaVA 模型，使用 <image> 作为图像占位符
+                # 关键修复：将图像占位符放在正确的位置，确保与模型期望一致
+                text = f"USER: <image>\n{question}\nASSISTANT: {response}"
+                all_texts.append(text)
+                
+                print(f"[DEBUG] Sample {i}: question='{question[:50]}...', response='{response[:50]}...'")
+                print(f"[DEBUG] Sample {i}: pixel_values type={type(pixel_values)}, shape={getattr(pixel_values, 'shape', 'N/A')}")
+                
+                # 处理图像
+                if pixel_values is not None:
+                    if isinstance(pixel_values, np.ndarray):
+                        pixel_values = torch.from_numpy(pixel_values.copy())
+                        print(f"[DEBUG] Sample {i}: converted numpy to tensor, shape={pixel_values.shape}")
+                    all_images.append(pixel_values)
                 else:
-                    pixel_values.append(torch.zeros(3, 224, 224))
-            pixel_values = torch.stack(pixel_values)
-            model_inputs["pixel_values"] = pixel_values
-        device = next(self.model.parameters()).device
+                    raise ValueError(f"pixel_values is None.")
+            
+            print(f"[DEBUG] Prepared {len(all_texts)} texts and {len(all_images)} images")
+            print(f"[DEBUG] First text: {all_texts[0]}")
+            print(f"[DEBUG] First image shape: {all_images[0].shape}")
+            
+            try:
+                print(f"[DEBUG] Processing images and texts...")
+                
+                print(f"[DEBUG] Using pre-processed images from idx2pixel_values")
+                
+                # 然后处理文本，确保图像token和图像特征一一对应
+                all_input_ids = []
+                all_attention_masks = []
+                
+                safe_max_length = getattr(self.tokenizer, 'model_max_length', None)
+                if safe_max_length is None or safe_max_length <= 0 or safe_max_length > 1000000:
+                    safe_max_length = 4096
+                
+                for i, text in enumerate(all_texts):
+                    print(f"[DEBUG] Processing sample {i}...")
+                    
+                    # 将 <image> 替换为实际的图像 token ID
+                    text_with_image_token = text.replace('<image>', self.tokenizer.image_token)
+                    
+                    # 使用 tokenizer 处理文本
+                    tokenized = self.tokenizer(
+                        text_with_image_token,
+                        return_tensors="pt",
+                        padding=False,
+                        truncation=True,
+                        max_length=safe_max_length
+                    )
+                    
+                    input_ids = tokenized['input_ids'].squeeze(0)
+                    attention_mask = tokenized['attention_mask'].squeeze(0)
+                    
+                    print(f"[DEBUG] Sample {i}: input_ids shape={input_ids.shape}, image_token_count={(input_ids == self.tokenizer.image_token_id).sum().item()}")
+                    
+                    all_input_ids.append(input_ids)
+                    all_attention_masks.append(attention_mask)
+                
+                # 填充到相同长度
+                max_len = max(len(ids) for ids in all_input_ids)
+                padded_input_ids = []
+                padded_attention_masks = []
+                
+                for ids, mask in zip(all_input_ids, all_attention_masks):
+                    # 填充 input_ids
+                    if len(ids) < max_len:
+                        padding = torch.full((max_len - len(ids),), self.tokenizer.pad_token_id, dtype=ids.dtype)
+                        padded_ids = torch.cat([ids, padding])
+                    else:
+                        padded_ids = ids
+                    
+                    # 填充 attention_mask
+                    if len(mask) < max_len:
+                        padding = torch.zeros(max_len - len(mask), dtype=mask.dtype)
+                        padded_mask = torch.cat([mask, padding])
+                    else:
+                        padded_mask = mask
+                    
+                    padded_input_ids.append(padded_ids)
+                    padded_attention_masks.append(padded_mask)
+                
+                # 构建最终的模型输入
+                model_inputs = {}
+                model_inputs['input_ids'] = torch.stack(padded_input_ids)
+                model_inputs['attention_mask'] = torch.stack(padded_attention_masks)
+                
+                # 重要：直接使用已经预处理过的图像，不进行额外的预处理
+                # 因为图像已经在数据准备阶段被 policy_image_processor 正确预处理过了
+                model_inputs['pixel_values'] = torch.stack(all_images)
+                
+                print(f"[DEBUG] Final model inputs:")
+                print(f"[DEBUG] - input_ids shape: {model_inputs['input_ids'].shape}")
+                print(f"[DEBUG] - attention_mask shape: {model_inputs['attention_mask'].shape}")
+                print(f"[DEBUG] - pixel_values shape: {model_inputs['pixel_values'].shape}")
+                print(f"[DEBUG] - Total image tokens: {(model_inputs['input_ids'] == self.tokenizer.image_token_id).sum().item()}")
+                print(f"[DEBUG] - Total images: {len(all_images)}")
+                
+                # 验证图像token和图像数量是否匹配
+                image_token_count = (model_inputs['input_ids'] == self.tokenizer.image_token_id).sum().item()
+                image_count = model_inputs['pixel_values'].shape[0]
+                if image_token_count != image_count:
+                    raise ValueError(f"Image tokens ({image_token_count}) and images ({image_count}) count mismatch!")
+                        
+            except Exception as e:
+                print(f"[DEBUG] Exception during image processing: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # 如果图像处理器处理失败，回退到纯文本处理
+                print(f"Warning: Image processor failed, falling back to text-only processing: {e}")
+                
+                # 手动构建输入
+                model_inputs = {}
+                
+                # 使用 tokenizer 处理文本
+                safe_max_length = getattr(self.tokenizer, 'model_max_length', None)
+                if safe_max_length is None or safe_max_length <= 0 or safe_max_length > 1000000:
+                    safe_max_length = 4096
+                
+                tokenized = self.tokenizer(
+                    all_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=safe_max_length
+                )
+                model_inputs['input_ids'] = tokenized['input_ids']
+                model_inputs['attention_mask'] = tokenized['attention_mask']
+                
+                # 手动构建 pixel_values
+                pixel_values = torch.stack(all_images)
+                print(f"[DEBUG] Fallback build - pixel_values shape: {pixel_values.shape}")
+                
+                # 保持原始图像尺寸，不进行调整
+                print(f"[DEBUG] Using original image size: {pixel_values.shape[-2:]}")
+                model_inputs['pixel_values'] = pixel_values
+                
+                print(f"[DEBUG] Fallback build - input_ids shape: {model_inputs['input_ids'].shape}")
+                print(f"[DEBUG] Fallback build - attention_mask shape: {model_inputs['attention_mask'].shape}")
+                print(f"[DEBUG] Fallback build - pixel_values shape: {model_inputs['pixel_values'].shape}")
+            
+        else:
+            # 纯文本处理（没有图像或图像处理器）
+            # Tokenize all pairs
+            # 安全获取 max_length，避免 OverflowError
+            safe_max_length = getattr(self.tokenizer, 'model_max_length', None)
+            if safe_max_length is None or safe_max_length <= 0 or safe_max_length > 1000000:
+                safe_max_length = 4096  # 默认安全值
+            
+            prompt_enc = self.tokenizer(
+                questions,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=safe_max_length
+            )
+            target_enc = self.tokenizer(
+                responses,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=safe_max_length
+            )
+            input_ids = torch.cat([prompt_enc.input_ids, target_enc.input_ids], dim=1)
+            attention_mask = torch.cat([prompt_enc.attention_mask, target_enc.attention_mask], dim=1)
+            model_inputs = dict(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # 安全获取设备，避免 StopIteration
+        device = None
+        
+        # 尝试多种方式获取设备
+        try:
+            # 1. 尝试从模型参数获取设备
+            for param in self.model.parameters():
+                device = param.device
+                break
+        except (StopIteration, AttributeError):
+            pass
+        
+        if device is None:
+            try:
+                # 2. 尝试从 DeepSpeed 引擎的 module 获取设备
+                if hasattr(self.model, 'module'):
+                    for param in self.model.module.parameters():
+                        device = param.device
+                        break
+            except (StopIteration, AttributeError):
+                pass
+        
+        if device is None:
+            try:
+                # 3. 尝试从模型本身获取设备
+                if hasattr(self.model, 'device'):
+                    device = self.model.device
+                elif hasattr(self.model, 'config') and hasattr(self.model.config, 'device'):
+                    device = self.model.config.device
+                elif hasattr(self.model, 'module') and hasattr(self.model.module, 'device'):
+                    device = self.model.module.device
+            except (AttributeError, TypeError):
+                pass
+        
         for k, v in model_inputs.items():
             if isinstance(v, torch.Tensor):
                 model_inputs[k] = v.to(device)
-        # Forward pass
+        
+        # Forward pass - 避免递归调用
         if requires_grad:
-            outputs = self.model(**model_inputs)
+            if hasattr(self.model, 'module'):
+                # DeepSpeed 引擎的情况
+                outputs = self.model.module(**model_inputs)
+            else:
+                # 原始模型的情况
+                outputs = self.model(**model_inputs)
         else:
             with torch.no_grad():
-                outputs = self.model(**model_inputs)
+                if hasattr(self.model, 'module'):
+                    # DeepSpeed 引擎的情况
+                    outputs = self.model.module(**model_inputs)
+                else:
+                    # 原始模型的情况
+                    outputs = self.model(**model_inputs)
+        
         logits = outputs.logits
         batch_size = len(prefered_inferior_response_list)
         logps = []
+        
+        # 批量处理所有样本，提高 GPU 利用率
+        all_target_logits = []
+        all_target_tokens = []
+        all_masks = []
+        
         for i in range(batch_size * 2):
             prompt_len = prompt_enc.input_ids[i].shape[0]
             target_len = target_enc.input_ids[i].shape[0]
@@ -386,16 +636,29 @@ class VisionActor(nn.Module):
             # 假设prompt和target padding后、拼接后的为：[<pad>, <pad>, 101, 102, 103, <pad>, <pad>, <pad>, 201, 202]
             # target的最后一个202由201对应的logit预测，所以是prompt_len - 1 + target_len - 1
             target_logits = logits[i, prompt_len - 1 : prompt_len - 1 + target_len - 1, :]
-            target_tokens = target_enc.input_ids[i, 1:]
-            log_probs = torch.log_softmax(target_logits, dim=-1)
-            target_logp = log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
-            mask = target_tokens != self.tokenizer.pad_token_id
+            target_tokens = target_enc.input_ids[i, 1:].to(device)
+            
+            all_target_logits.append(target_logits)
+            all_target_tokens.append(target_tokens)
+            
+            # 创建 mask
+            pad_token_id = torch.tensor(self.tokenizer.pad_token_id, device=device)
+            mask = target_tokens != pad_token_id
             if hasattr(self.tokenizer, "bos_token_id") and self.tokenizer.bos_token_id is not None:
-                mask &= (target_tokens != self.tokenizer.bos_token_id)
-            sample_logp = (target_logp * mask.float()).sum()
+                bos_token_id = torch.tensor(self.tokenizer.bos_token_id, device=device)
+                mask &= (target_tokens != bos_token_id)
+            all_masks.append(mask)
+        
+        # 批量计算 log probabilities
+        logps = []
+        for i in range(batch_size * 2):
+            log_probs = torch.log_softmax(all_target_logits[i], dim=-1)
+            target_logp = log_probs.gather(1, all_target_tokens[i].unsqueeze(-1)).squeeze(-1)
+            sample_logp = (target_logp * all_masks[i].float()).sum()
             if not requires_grad:
                 sample_logp = sample_logp.detach().cpu()
             logps.append(sample_logp)
+        
         # Split back to original mapping
         results = []
         for i, item in enumerate(prefered_inferior_response_list):
