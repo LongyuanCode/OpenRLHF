@@ -152,6 +152,8 @@ if __name__ == "__main__":
     
     # Dataset parameters
     parser.add_argument("--dataset_name", type=str, required=True, help="Dataset name or path for training.")
+    parser.add_argument("--is_put_images_object_store", type=lambda x: x.lower() == 'true', default=False, help="Whether to put images into object store.")
+    parser.add_argument("--max_data_num", type=int, default=5000, help="Maximum number of data to use for training.")
     
     # Checkpoints
     parser.add_argument(
