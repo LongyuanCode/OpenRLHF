@@ -272,7 +272,6 @@ class ActorPPOTrainer(ABC):
         if self.args.use_dynamic_batch:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
-        # 下面两行是使用deepspeed引擎进行的反向传播和梯度更新。
         self.strategy.backward(loss, self.actor, self.actor_optim)
         if self.args.use_dynamic_batch:
             if self.replay_buffer.dynamic_optimizer_step[step]:

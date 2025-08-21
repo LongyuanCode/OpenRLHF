@@ -10,6 +10,8 @@ def torch_dist_barrier_and_cuda_sync():
     torch.cuda.synchronize()
 
 def torch_dist_cuda_sync_and_barrier():
+    import torch
+
     torch.cuda.synchronize()
     torch.distributed.barrier()
 

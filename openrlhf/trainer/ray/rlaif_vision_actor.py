@@ -2,6 +2,7 @@ import math
 import os
 import random
 import socket
+import io
 
 import deepspeed
 import numpy as np
@@ -21,6 +22,7 @@ from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
 from .launcher import BaseModelActor
 from .utils import get_physical_gpu_id
+from PIL import Image
 
 import logging
 logging.basicConfig(
@@ -125,35 +127,7 @@ class MultiModalLLMRayActor(LLMRayActor):
         return max_len
 
     def get_tokenizer(self):
-        """
-        稳定获取与当前 vLLM 引擎一致的 HF tokenizer。
-        1) 优先从 vLLM 的 llm_engine 中获取模型名；
-        2) 回退到 self.llm 或初始化时 kwargs 中的 model；
-        3) 使用 AutoTokenizer 加载，并确保 pad_token 存在。
-        """
-        # 1) 从 vLLM 引擎读取模型名
-        model_name = None
-        try:
-            model_config = self.llm.llm_engine.get_model_config()
-            model_name = getattr(model_config, "model", None)
-        except Exception:
-            pass
-
-        # 2) 回退路径
-        if model_name is None:
-            model_name = getattr(self.llm, "model", None)
-        if model_name is None:
-            model_name = getattr(self, "kwargs", {}).get("model", None)
-        if model_name is None:
-            raise ValueError("无法确定模型名称以加载 tokenizer")
-
-        # 3) 加载 HF tokenizer
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        return tokenizer
+        return self.llm.get_tokenizer()
 
     def get_image_processor(self):
         try:
@@ -169,12 +143,11 @@ class MultiModalLLMRayActor(LLMRayActor):
                     # 最后的备选方案：从 kwargs 中获取
                     model_name = self.kwargs.get('model', None)
             except:
-                raise AttributeError("无法获取模型配置信息")
+                raise AttributeError("No model config information.")
         
         if model_name is None:
-            raise ValueError("无法确定模型名称")
+            raise ValueError("No model name.")
         
-        # 修复：使用 AutoProcessor 来处理多模态输入（图像+文本）
         try:
             processor = AutoProcessor.from_pretrained(
                 model_name, 
@@ -187,15 +160,6 @@ class MultiModalLLMRayActor(LLMRayActor):
             print(f"警告：无法加载处理器 - {e}")
             return None
 
-class DataServerActor:
-    def __init__(self, ai_feedback: List[Dict]):
-        self.ai_feedback = ai_feedback
-    
-    def get_data(self, idx: str):
-        return self.ai_feedback[idx]
-    
-    def get_batch(self, idxes: List[str]):
-        return [self.ai_feedback[idx] for idx in idxes]
 
 class VisionActorTrainer(ABC):
     def __init__(
@@ -345,12 +309,15 @@ class VisionActorTrainer(ABC):
         """
         import torch.distributed as dist
         world_size = dist.get_world_size() if dist.is_initialized() else 1
+        print(f"chuanwei2 world_size: {world_size}")
         if world_size == 1:
+            print(f"chuanwei2 return local loss.")
             return local_loss
         # 复制一份，避免原地修改
         loss_clone = local_loss.clone().detach()
         dist.all_reduce(loss_clone, op=dist.ReduceOp.SUM)
         loss_clone /= world_size
+        print(f"chuanwei2 return return all losses.")
         return loss_clone
 
     def train_step(self, batch):
@@ -375,16 +342,23 @@ class VisionActorTrainer(ABC):
         # 分别收集logp_1和logp_0
         policy_chosen_logps = torch.stack([item['logp_1'] for item in logp_results])
         policy_rejected_logps = torch.stack([item['logp_0'] for item in logp_results])
+        print(f"chuanwei policy_chosen_logps: {policy_chosen_logps}")
+        print(f"chuanwei policy_rejected_logps: {policy_rejected_logps}")
+        print(f"chuanwei reference_chosen_logps: {reference_chosen_logps}")
+        print(f"chuanwei reference_rejected_logps: {reference_rejected_logps}")
         loss, _, _ = self.loss_fn(
                     policy_chosen_logps,
                     policy_rejected_logps,
                     reference_chosen_logps,
                     reference_rejected_logps
                 )
+        print(f"chuanwei loss: {loss}")
         self.strategy.backward(loss, self.vision_actor, self.vision_actor_optim)
         self.strategy.optimizer_step(self.vision_actor_optim, self.vision_actor, self.vision_actor_scheduler)
 
+        print(f"chaunwei2 368 self.strategy.is_rank_0(): {self.strategy.is_rank_0()}")
         if self.strategy.is_rank_0():
+            print(f"chuanwei2 370 self.strategy.is_rank_0()")
             # If all_reduce all losses every batch makes efficiency low,
             # one can all_reduce all losses every epoch.
             # all_reduce itself is a synchronization operation so we 
@@ -392,6 +366,7 @@ class VisionActorTrainer(ABC):
             global_loss = self.get_global_loss(loss)
             return global_loss.item()
         
+        print(f"chuanwei2 378return None")
         return None
 
     def train_epoch(self, dataloader, epoch: int, max_epochs: int):
@@ -412,9 +387,12 @@ class VisionActorTrainer(ABC):
             except Exception as e:
                 print(f"Error in training step {batch_idx}: {e}")
                 continue
+        print(f"chuanwei2 399 self.strategy.is_rank_0(): {self.strategy.is_rank_0()}")
         if self.strategy.is_rank_0():
+            print(f"chuanwei2 401 return epoch_losses: {epoch_losses}")
             return epoch_losses
         else:
+            print(f"chuanwei2 404 return epoch_losses: None")
             return None
 
     def train(self, dataset, batch_size: int, num_epochs: int, 
@@ -449,7 +427,10 @@ class VisionActorTrainer(ABC):
             
             # 训练一个 epoch
             epoch_global_losses = self.train_epoch(dataloader, epoch, num_epochs)
+            print(f"chuanwei2 439 epoch_global_losses: {epoch_global_losses}")
+            print(f"chuanwei2 440 self.strategy.is_rank_0(): {self.strategy.is_rank_0()}")
             if self.strategy.is_rank_0():
+                print(f"chuanwei2 rank0 epoch_global_losses: {epoch_global_losses}")
                 training_history.append(epoch_global_losses)
             
             # 同步所有进程
@@ -461,11 +442,14 @@ class VisionActorTrainer(ABC):
                 }
                 self.save_checkpoint(save_path=self.args.ckpt_path, epoch=epoch, client_states=client_states)
         
+        print(f"chuanwei2 454 self.strategy.is_rank_0(): {self.strategy.is_rank_0()}")
         if self.strategy.is_rank_0():
             if self.wandb is not None:
                 self.wandb.finish()
+            print(f"chuanwei2 458 return training_history: {training_history}")
             return training_history
         else:
+            print(f"chuanwei2 461 return None")
             return None
 
     def save_checkpoint(self, save_path: str, epoch: int, client_states: dict):
@@ -801,12 +785,16 @@ class LabelerRayActor(MultiModalLLMRayActor):
         # 构造最终结果
         result = []
         for q_idx, qa in enumerate(q_candidate_a):
-            result.append({
+            result_item = {
                 "idx": qa["idx"],
                 "question": qa["question"],
                 "candidate_response": qa["candidate_response"],
                 "facts": facts_nested[q_idx]
-            })
+            }
+            # 如果输入包含图片数据，则传递到输出
+            if "image_bytes" in qa:
+                result_item["image_bytes"] = qa["image_bytes"]
+            result.append(result_item)
         return result
 
     def conquer(
@@ -879,6 +867,7 @@ class LabelerRayActor(MultiModalLLMRayActor):
         cand_simple_questions = []
         for text in raw_outputs:
             lines = []
+            q = None
             for line in text.splitlines():
                 ls = line.strip()
                 if ls.startswith("###"):
@@ -905,11 +894,15 @@ class LabelerRayActor(MultiModalLLMRayActor):
                     "simple_questions": simple_questions
                 })
                 idx += 1
-            result.append({
+            result_item = {
                 "idx": item["idx"],
                 "question": question,
                 "candidates": candidates
-            })
+            }
+            # 如果输入包含图片数据，则传递到输出
+            if "image_bytes" in item:
+                result_item["image_bytes"] = item["image_bytes"]
+            result.append(result_item)
         return result
 
     def YesNo(
@@ -923,17 +916,31 @@ class LabelerRayActor(MultiModalLLMRayActor):
         """
         输入：
             batch: List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...]}。
-            dataset: idx到样本的字典，通过'idx'查找图片。
+                   如果不使用对象存储，还包含'image_bytes'字段。
+            source_idxes: 源数据索引列表
         输出：
             List[Dict]，每个元素包含'idx'、'question'和'candidates'，'candidates'为List，每个元素为{'candidate_response': ..., 'simple_questions': [...], 'simple_answers': [{'1': Yes/yes scores, '0': No/no scores}]}。
         """
-        pixel_values_dict = self.pixel_values_object_ref
+        # 根据是否使用对象存储来获取图片数据
+        if self.pixel_values_object_ref is not None:
+            # 使用对象存储
+            pixel_values_dict = self.pixel_values_object_ref
+        else:
+            # 不使用对象存储，从 batch 数据中获取图片数据
+            pixel_values_dict = {}
+            for item in batch:
+                if "image_bytes" in item:
+                    pixel_values_dict[item["idx"]] = item["image_bytes"]
+            if not pixel_values_dict:
+                raise ValueError("No image data found in batch and pixel_values_object_ref is None")
+
         tokenizer = self.get_tokenizer()
+        image_processor = self.get_image_processor()
 
         # 先构建结果骨架，便于回填
         results: list[dict] = []
         for item in batch:
-            results.append({
+            result_item = {
                 "idx": item["idx"],
                 "question": item["question"],
                 "candidates": [
@@ -944,7 +951,11 @@ class LabelerRayActor(MultiModalLLMRayActor):
                     }
                     for cand in item["candidates"]
                 ],
-            })
+            }
+            # 如果输入包含图片数据，则传递到输出
+            if "image_bytes" in item:
+                result_item["image_bytes"] = item["image_bytes"]
+            results.append(result_item)
 
         # 将整个 batch 的所有 simple_questions 扁平化，一次性推理
         from vllm import SamplingParams
@@ -954,13 +965,20 @@ class LabelerRayActor(MultiModalLLMRayActor):
         back_mapping: list[tuple[int, int]] = []  # (item_idx, cand_idx)
 
         for i, item in enumerate(batch):
-            # 取该样本对应的图像
-            pixel_values_np = pixel_values_dict[source_idxes[i]]["labeler_pixel_values"]
-            if isinstance(pixel_values_np, np.ndarray):
-                pixel_values_np = pixel_values_np.copy()
-                pixel_values_tensor = torch.from_numpy(pixel_values_np)
+            # 取该样本对应的图像字节并在消费端处理
+            image_bytes = pixel_values_dict[source_idxes[i]]
+            if image_bytes is None:
+                raise ValueError(f"No image bytes for idx {source_idxes[i]}")
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            if image_processor is None:
+                raise ValueError("Image processor is None; cannot process image bytes.")
+            processed = image_processor(images=[img], text=[item["question"]], return_tensors="pt", padding=True)
+            if "pixel_values" in processed:
+                pixel_values_tensor = processed["pixel_values"][0]
+            elif "images" in processed:
+                pixel_values_tensor = processed["images"][0]
             else:
-                pixel_values_tensor = pixel_values_np
+                raise KeyError(f"Processor output missing pixel_values/images. Keys: {list(processed.keys())}")
             multi_modal_data = {"image": pixel_values_tensor}
 
             for j, cand in enumerate(item["candidates"]):
@@ -988,7 +1006,6 @@ class LabelerRayActor(MultiModalLLMRayActor):
             chat_prompts = self._format_chat_prompts(tokenizer, flat_prompts)
             outputs_raw = self.generate_multimodal(chat_prompts, flat_sampling_params, flat_multi_modal_data)
             generated_texts = [o.outputs[0].text for o in outputs_raw]
-            print(f"chuanwei YesNo generated_texts: {generated_texts}")
 
             for (i_idx, j_idx), text in zip(back_mapping, generated_texts):
                 t = (text or "").strip()
@@ -1039,11 +1056,15 @@ class LabelerRayActor(MultiModalLLMRayActor):
                     prefered = candidates[idx1]['candidate_response']
                     inferior = candidates[idx2]['candidate_response']
                     pairs.append({"1": prefered, "0": inferior})
-                results.append({
+                result_item = {
                     "idx": item["idx"],
                     "question": item["question"],
                     "prefered_inferior_pairs": pairs
-                })
+                }
+                # 如果输入包含图片数据，则传递到输出
+                if "image_bytes" in item:
+                    result_item["image_bytes"] = item["image_bytes"]
+                results.append(result_item)
         return results
 
 
@@ -1056,11 +1077,25 @@ class PolicyRayActor(MultiModalLLMRayActor):
         # 添加调试信息
         self.pixel_values_object_ref = pixel_values_object_ref
 
-    def generate_n_candidates(self, questions, item_indexes, n_candidates, **gen_kwargs):
+    def generate_n_candidates(self, questions=None, item_indexes=None, questions_with_images=None, n_candidates=2, **gen_kwargs):
         from vllm import SamplingParams     # or AsyncLLMEngine if needed
         from torchvision import transforms
 
-        batch_size = len(questions)
+        # 处理两种不同的输入格式
+        if questions_with_images is not None:
+            # 不使用对象存储，数据中已包含图片
+            batch_size = len(questions_with_images)
+            questions = [item['question'] for item in questions_with_images]
+            item_indexes = [item['idx'] for item in questions_with_images]
+            image_bytes_dict = {item['idx']: item['image_bytes'] for item in questions_with_images}
+            has_images = True
+        elif questions is not None and item_indexes is not None:
+            # 使用对象存储
+            batch_size = len(questions)
+            image_bytes_dict = self.pixel_values_object_ref if self.pixel_values_object_ref is not None else None
+            has_images = image_bytes_dict is not None
+        else:
+            raise ValueError("Either questions_with_images or (questions + item_indexes) must be provided")
 
         sampling_params = SamplingParams(
             temperature=gen_kwargs.get('temperature', 0.7),
@@ -1071,24 +1106,29 @@ class PolicyRayActor(MultiModalLLMRayActor):
             skip_special_tokens=False,
         )
 
-        # 直接使用已经反序列化的数据，不需要再次调用 ray.get()
-        pixel_values_dict = self.pixel_values_object_ref if self.pixel_values_object_ref is not None else None
-        has_images = pixel_values_dict is not None
-
         if has_images:
             # 直接构建多模态输入列表
             prompts = []
             sampling_params_list = []
             multi_modal_data_list = []
             
+            img_processor = self.get_image_processor()
+            if img_processor is None:
+                raise ValueError("Image processor is None; cannot process image bytes.")
+
             for i, question in enumerate(questions):
                 prompt = f"USER: <image>\n{question}\nASSISTANT:"
-                pixel_values_np = pixel_values_dict[item_indexes[i]]['pixel_values']
-                if isinstance(pixel_values_np, np.ndarray):
-                    pixel_values_np = pixel_values_np.copy()
-                    pixel_values_tensor = torch.from_numpy(pixel_values_np)
+                image_bytes = image_bytes_dict[item_indexes[i]]
+                if image_bytes is None:
+                    raise ValueError(f"No image bytes for idx {item_indexes[i]}")
+                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                processed = img_processor(images=[img], text=[question], return_tensors="pt", padding=True)
+                if "pixel_values" in processed:
+                    pixel_values_tensor = processed["pixel_values"][0]
+                elif "images" in processed:
+                    pixel_values_tensor = processed["images"][0]
                 else:
-                    pixel_values_tensor = pixel_values_np
+                    raise KeyError(f"Processor output missing pixel_values/images. Keys: {list(processed.keys())}")
                 multi_modal_data = {"image": pixel_values_tensor}
                 
                 for seed in range(n_candidates):
@@ -1121,6 +1161,11 @@ class PolicyRayActor(MultiModalLLMRayActor):
                 q_candidate_a[i].update({"idx": item_indexes[i]})
                 q_candidate_a[i].update({"question": questions[i]})
                 q_candidate_a[i].update({"candidate_response": candidates_one_q})
+
+                # 如果不使用对象存储，将图片数据包含在返回结果中
+                if questions_with_images is not None:
+                    q_candidate_a[i].update({"image_bytes": image_bytes_dict[item_indexes[i]]})
+
             return q_candidate_a
         else:
             logging.warning("chuanwei No images found, returning None")

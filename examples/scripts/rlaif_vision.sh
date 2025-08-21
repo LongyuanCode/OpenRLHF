@@ -2,16 +2,18 @@
 #RAY_ADDRESS='http://127.0.0.1:8265' ray job submit --working-dir . -- \
 python openrlhf/cli/rlaif_train_ray.py \
     --dataset_name "OpenBMB/RLAIF-V-Dataset" \
+    --max_data_num 5000 \
+    --is_put_images_object_store False \
     --prefered_inferior_pair_num 2 \
     --num_labeler_vllm_engines 2 \
     --num_policy_vllm_engines 2 \
     --enforce_eager_labeler \
     --enforce_eager_policy \
     --gpu_memory_utilization_labeler 0.9 \
-    --vllm_enable_sleep_labeler True \
+    --vllm_enable_sleep_labeler False \
     --enable_prefix_caching_policy False \
     --gpu_memory_utilization_policy 0.9 \
-    --vllm_enable_sleep_policy True \
+    --vllm_enable_sleep_policy False \
     --enable_prefix_caching_labeler False \
     --use_ds_universal_ckpt \
     --zero_stage 2 \
@@ -39,7 +41,7 @@ python openrlhf/cli/rlaif_train_ray.py \
     --max_len 1024 \
     --prompt_max_len 600 \
     --generate_max_len 256 \
-    --labeler_batch_size 1 \
+    --labeler_batch_size 100 \
     --num_epochs 1 \
     --num_workers 4 \
     --num_gpus_per_node 4 \
