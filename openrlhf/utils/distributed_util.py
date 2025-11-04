@@ -9,6 +9,11 @@ def torch_dist_barrier_and_cuda_sync():
     torch.distributed.barrier()
     torch.cuda.synchronize()
 
+def torch_dist_cuda_sync_and_barrier():
+    import torch
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
 
 def stateless_init_process_group(master_address, master_port, rank, world_size, device):
     """

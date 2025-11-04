@@ -10,6 +10,9 @@ from openrlhf.utils.logging_utils import init_logger
 
 from .utils import get_bundle_indices, ray_noset_visible_devices
 
+import torch
+import os
+
 logger = init_logger(__name__)
 
 
@@ -20,6 +23,10 @@ def get_all_env_variables():
     return os.environ
 
 
+import inspect
+import dataclasses
+from vllm.engine.arg_utils import EngineArgs
+
 class BaseLLMRayActor:
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         kwargs.pop("agent_func_path", None)
@@ -28,6 +35,9 @@ class BaseLLMRayActor:
             # a hack to make the script work.
             # stop ray from manipulating *_VISIBLE_DEVICES
             # at the top-level when the distributed_executor_backend is ray.
+            # chuanwei.tang: Ray control visibility of GPU for actors
+            # by setting *_VISIBLE_DEVICES automatically which conflicts with
+            # counterparts among environment variables.
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
             os.environ.pop("HIP_VISIBLE_DEVICES", None)
@@ -41,7 +51,6 @@ class BaseLLMRayActor:
         if bundle_indices is not None:
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
-            print(f"creating LLM with bundle_indices={bundle_indices}")
 
         # Number of actors that will send prompt to this engine
         self.requests = {}
@@ -61,14 +70,33 @@ class BaseLLMRayActor:
             os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 
-@ray.remote
 class LLMRayActor(BaseLLMRayActor):
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
+        # 提前取出共享 PG 句柄，避免被后续 EngineArgs 过滤
+        self._shared_pg = kwargs.pop("shared_pg_handle", None)
         super().__init__(*args, bundle_indices=bundle_indices, **kwargs)
 
         import vllm
+        # 1) 用 inspect.signature 拿到 EngineArgs.__init__ 的签名
+        sig = inspect.signature(EngineArgs.__init__)
+        # 2) 从 kwargs 里过滤出签名里真正存在的那部分参数
+        valid_kwargs = {
+            name: kwargs[name]
+            for name in sig.parameters
+            if name in kwargs and name != 'self'
+        }
 
-        self.llm = vllm.LLM(*args, **self.kwargs)
+        engine_args = EngineArgs(**valid_kwargs)
+        llm_kwargs = dataclasses.asdict(engine_args)
+
+        # 4) 打印 —— dataclasses.asdict 会把所有字段都展开，包括默认值
+        print("chuanwei ===== vLLM EngineArgs 全量配置 =====")
+        for k, v in llm_kwargs.items():
+            print(f"  {k}: {v!r}")
+        print("chuanwei ====================================")
+
+        self.llm = vllm.LLM(**llm_kwargs)
+        print(f"chuanwei engine created.")
 
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray):
         return self.llm.collective_rpc(
@@ -90,6 +118,35 @@ class LLMRayActor(BaseLLMRayActor):
 
     def wake_up(self):
         self.llm.wake_up()
+
+    def get_shared_pg(self):
+        return self._shared_pg
+
+    def shutdown(self, level: int = 2):
+        """
+        优雅下线 vLLM 引擎以释放显存与内部缓存。注意：这不会释放 Ray 的 GPU 令牌或其所在的
+        Placement Group，需要在调用方额外执行 ray.kill(..., no_restart=True) 与
+        remove_placement_group(shared_pg)。
+        """
+        try:
+            # 深度睡眠以释放 KV/显存缓存
+            self.llm.sleep(level=level)
+        except Exception:
+            pass
+        try:
+            # 清理前缀缓存
+            self.llm.llm_engine.reset_prefix_cache()
+        except Exception:
+            pass
+        try:
+            import gc
+            import torch
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        return True
 
     def add_requests(self, sampling_params, prompt_token_ids):
         """
@@ -124,6 +181,8 @@ def create_vllm_engines(
     llm_actor_cls=LLMRayActor,
     logprobs_mode=None,
     agent_func_path=None,
+    quantization=None,
+    quantization_param_path=None,
 ):
     import vllm
     from packaging import version
@@ -156,39 +215,54 @@ def create_vllm_engines(
             placement_group_bundle_index=bundle_indices[0] if bundle_indices else i,
         )
 
-        additional_kwargs = {}
+        # Choose appropriate dtype based on quantization
+        # For GPTQ models, float16 is typically more compatible than bfloat16
+        dtype = "float16" if quantization == "gptq" else torch.float16
+        
+        # Prepare kwargs for vLLM engine creation
+        engine_kwargs = {
+            "model": pretrain,
+            "enforce_eager": enforce_eager,
+            "worker_extension_cls": "openrlhf.trainer.ray.vllm_worker_wrap.WorkerWrap",
+            "tensor_parallel_size": tensor_parallel_size,
+            "seed": seed + i,
+            "distributed_executor_backend": distributed_executor_backend,
+            "max_model_len": max_model_len,
+            "enable_prefix_caching": enable_prefix_caching,
+            "dtype": dtype,
+            "trust_remote_code": False,
+            "full_determinism": full_determinism,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "bundle_indices": bundle_indices,
+            "num_gpus": 0.2 if use_hybrid_engine else 1,
+            "enable_sleep_mode": vllm_enable_sleep,
+            "agent_func_path": agent_func_path,
+            "mm_processor_kwargs": {"use_fast": True},
+            "limit_mm_per_prompt": {"image": 1},
+            # 传递共享 PG 句柄给引擎，便于后续在外部安全释放
+            "shared_pg_handle": shared_pg,
+        }
         if logprobs_mode:
-            additional_kwargs["logprobs_mode"] = logprobs_mode
-            additional_kwargs["max_logprobs"] = 1
+            engine_kwargs.update({"logprobs_mode": logprobs_mode, "max_logprobs": 1})
             assert version.parse(vllm.__version__) > version.parse(
                 "0.10.0"
             ), "vLLM > 0.10.0 is required for logprobs_mode"
+        
+        # Add quantization parameters if specified
+        if quantization is not None:
+            engine_kwargs["quantization"] = quantization
+            
+        if quantization_param_path is not None:
+            engine_kwargs["quantization_param_path"] = quantization_param_path
 
-        vllm_engines.append(
-            llm_actor_cls.options(
-                num_cpus=num_gpus,
-                num_gpus=num_gpus,
-                scheduling_strategy=scheduling_strategy,
-            ).remote(
-                model=pretrain,
-                enforce_eager=enforce_eager,
-                worker_extension_cls="openrlhf.trainer.ray.vllm_worker_wrap.WorkerWrap",
-                tensor_parallel_size=tensor_parallel_size,
-                seed=seed + i,
-                distributed_executor_backend=distributed_executor_backend,
-                max_model_len=max_model_len,
-                enable_prefix_caching=enable_prefix_caching,
-                dtype="bfloat16",
-                trust_remote_code=True,
-                full_determinism=full_determinism,
-                gpu_memory_utilization=gpu_memory_utilization,
-                bundle_indices=bundle_indices,
-                num_gpus=0.2 if use_hybrid_engine else 1,
-                enable_sleep_mode=vllm_enable_sleep,
-                agent_func_path=agent_func_path,
-                **additional_kwargs,
-            )
-        )
+
+        engine_ref = ray.remote(llm_actor_cls).options(
+            num_cpus=num_gpus,
+            num_gpus=num_gpus,
+            scheduling_strategy=scheduling_strategy,
+        ).remote(**engine_kwargs)
+
+        vllm_engines.append(engine_ref)
 
     if vllm_enable_sleep:
         batch_vllm_engine_call(vllm_engines, "sleep")

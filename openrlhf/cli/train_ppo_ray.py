@@ -57,6 +57,8 @@ def train(args):
         else:
             from openrlhf.trainer.ray.vllm_engine import LLMRayActor
 
+        # Finally in file openrlhf/trainer/ppo_utils/experience_maker.py
+        # vllm_engines is invoked.
         vllm_engines = create_vllm_engines(
             args.vllm_num_engines,
             args.vllm_tensor_parallel_size,

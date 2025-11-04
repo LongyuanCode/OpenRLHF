@@ -239,7 +239,7 @@ class RayActorGroup:
             pg = placement_group(bundles, strategy="PACK")
             ray.get(pg.ready())
         if pg:
-            master_actor = self.ray_actor_type.options(
+            master_actor = ray.remote(self.ray_actor_type).options(
                 num_cpus=num_gpus_per_actor,
                 num_gpus=num_gpus_per_actor,
                 resources=self._resources,
@@ -248,7 +248,7 @@ class RayActorGroup:
                 ),
             ).remote(world_size, 0, None, None)
         else:
-            master_actor = self.ray_actor_type.options(
+            master_actor = ray.remote(self.ray_actor_type).options(
                 num_cpus=num_gpus_per_actor,
                 num_gpus=num_gpus_per_actor,
                 resources=self._resources,
@@ -260,7 +260,7 @@ class RayActorGroup:
             master_addr, master_port = ray.get(master_actor.get_master_addr_port.remote())
             for rank in range(1, world_size):
                 if pg:
-                    worker_actor = self.ray_actor_type.options(
+                    worker_actor = ray.remote(self.ray_actor_type).options(
                         num_cpus=num_gpus_per_actor,
                         num_gpus=num_gpus_per_actor,
                         resources=self._resources,
@@ -270,7 +270,7 @@ class RayActorGroup:
                         ),
                     ).remote(world_size, rank, master_addr, master_port)
                 else:
-                    worker_actor = self.ray_actor_type.options(
+                    worker_actor = ray.remote(self.ray_actor_type).options(
                         num_cpus=num_gpus_per_actor,
                         num_gpus=num_gpus_per_actor,
                         resources=self._resources,
@@ -354,4 +354,133 @@ class RayActorGroup:
 
                 refs.append(actor.execute_batch.remote(method_name, all_data_ref, start_idx, end_idx))
 
+        return refs
+
+    def run_method_per_batch_per_logical_actor(self, method_name: str, data_list: list, requires_grad: bool = False, **method_kwargs):
+        """Run method on all actors with batched input data using per-logical-actor chunking.
+        Each logical actor processes one chunk of data at a time with batch computation.
+        Actors in the same duplicate group process the same chunk.
+
+        Args:
+            method_name (str): Name of the method to run
+            data_list (list): List of data items to process
+            requires_grad (bool): Whether to compute gradients
+            **method_kwargs: Additional keyword arguments for the method
+
+        Returns:
+            list: List of results from all data items, maintaining original order
+        """
+        if not data_list:
+            return []
+
+        # Get actor information
+        actors = self._actor_handlers
+        duplicate_actors = self.duplicate_actors
+        num_actors = len(actors)
+        
+        # Calculate effective logical actors (considering duplicate groups)
+        effective_actors = max(1, num_actors // max(1, duplicate_actors)) if num_actors > 0 else 1
+        total = len(data_list)
+        
+        # Calculate chunk size
+        chunk_size = (total + effective_actors - 1) // effective_actors
+        
+        refs = []
+        group_sizes = []  # Number of physical actors in each logical actor group
+        
+        for i in range(effective_actors):
+            start = i * chunk_size
+            end = min((i + 1) * chunk_size, total)
+            if start >= end:
+                continue
+                
+            chunk = data_list[start:end]
+            
+            # Get physical actor indices for this logical actor group
+            this_group_actor_indices = []
+            for j in range(duplicate_actors):
+                actor_idx = i * duplicate_actors + j
+                if actor_idx < num_actors:
+                    this_group_actor_indices.append(actor_idx)
+            
+            # Handle single actor case
+            if not this_group_actor_indices and num_actors == 1:
+                this_group_actor_indices = [0]
+            
+            # Submit remote calls for this group
+            for actor_idx in this_group_actor_indices:
+                method = getattr(actors[actor_idx], method_name)
+                # Prepare method arguments
+                call_kwargs = dict(method_kwargs)
+                call_kwargs['requires_grad'] = requires_grad
+                # Add data as the first positional argument or as a keyword argument
+                if 'data' in call_kwargs:
+                    call_kwargs['data'] = chunk
+                else:
+                    # Assume the method expects data as first positional argument
+                    refs.append(method.remote(chunk, **call_kwargs))
+                    continue
+                refs.append(method.remote(**call_kwargs))
+            
+            group_sizes.append(len(this_group_actor_indices) if this_group_actor_indices else 1)
+
+        # Get results and deduplicate for duplicate groups
+        raw_results = ray.get(refs) if refs else []
+        dedup_results = []
+        pos = 0
+        for gsz in group_sizes:
+            if pos < len(raw_results):
+                dedup_results.append(raw_results[pos])
+            pos += max(1, gsz)
+
+        # Flatten results to maintain original data order
+        final_results = []
+        for chunk_result in dedup_results:
+            if isinstance(chunk_result, list):
+                final_results.extend(chunk_result)
+            else:
+                final_results.append(chunk_result)
+
+        return final_results
+
+    def async_train_with_distributed_sampling(self, dataset, batch_size: int, num_epochs: int, 
+                                            shuffle: bool = True, drop_last: bool = True, 
+                                            num_workers: int = 4, pin_memory: bool = True):
+        """Train with distributed sampling using DistributedSampler.
+        Each logical actor will get different data chunks through DistributedSampler.
+        
+        Args:
+            dataset: Training dataset
+            batch_size (int): Batch size per GPU
+            num_epochs (int): Number of training epochs
+            shuffle (bool): Whether to shuffle data
+            drop_last (bool): Whether to drop last incomplete batch
+            num_workers (int): Number of dataloader workers
+            pin_memory (bool): Whether to pin memory
+            
+        Returns:
+            List[ray.ObjectRef]: List of remote object references to training results
+        """
+        # 计算有效的逻辑actor数量（考虑duplicate_actors）
+        num_actors = len(self._actor_handlers)
+        effective_actors = max(1, num_actors // max(1, self.duplicate_actors)) if num_actors > 0 else 1
+        
+        refs = []
+        for i in range(effective_actors):
+            # 对于每个逻辑actor组，选择第一个物理actor来执行训练
+            # 因为同一个逻辑actor组中的物理actors会处理相同的数据
+            actor_idx = i * self.duplicate_actors
+            if actor_idx < num_actors:
+                actor = self._actor_handlers[actor_idx]
+                # 使用train_with_dataset方法而不是train方法
+                refs.append(actor.train_with_dataset.remote(
+                    dataset=dataset,
+                    batch_size=batch_size,
+                    num_epochs=num_epochs,
+                    shuffle=shuffle,
+                    drop_last=drop_last,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory
+                ))
+        
         return refs

@@ -18,10 +18,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from openrlhf.models import Actor
+from openrlhf.models import Actor, VisionActor
 from openrlhf.models.ring_attn_utils import get_ring_attn_group, set_ring_attn_group
 from openrlhf.utils.distributed_sampler import DistributedSampler
-from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync
+from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync, torch_dist_cuda_sync_and_barrier
 from .deepspeed_utils import (
     _z3_params_to_fetch,
     get_eval_ds_config,
@@ -133,7 +133,7 @@ class DeepspeedStrategy(ABC):
         return get_ring_attn_group()
 
     def create_optimizer(self, model, **kwargs) -> Optimizer:
-        if isinstance(model, Actor):
+        if isinstance(model, Actor) or isinstance(model, VisionActor):
             model = model.model
         # Optimizer
         AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
@@ -142,7 +142,7 @@ class DeepspeedStrategy(ABC):
         return optim
 
     def backward(self, loss: torch.Tensor, model: nn.Module, optimizer: optim.Optimizer, **kwargs) -> None:
-        if isinstance(model, Actor):
+        if isinstance(model, Actor)  or isinstance(model, VisionActor):
             model = model.model
         model.backward(loss)
 
@@ -154,7 +154,7 @@ class DeepspeedStrategy(ABC):
         name="model",
         **kwargs,
     ) -> None:
-        if isinstance(model, Actor):
+        if isinstance(model, Actor)  or isinstance(model, VisionActor):
             model = model.model
         model.step()
 
@@ -196,7 +196,7 @@ class DeepspeedStrategy(ABC):
         )
 
     def _unwrap_model(self, model) -> nn.Module:
-        if isinstance(model, Actor):
+        if isinstance(model, Actor)  or isinstance(model, VisionActor):
             return self._unwrap_model(model.model)
         elif hasattr(model, "module"):
             return model.module
@@ -221,7 +221,7 @@ class DeepspeedStrategy(ABC):
         return ret[0] if len(ret) == 1 else ret
 
     def _ds_init_train_model(self, model, optim, scheduler):
-        is_actor = isinstance(model, Actor)
+        is_actor = isinstance(model, Actor) or isinstance(model, VisionActor)
         ds_config = self.get_ds_train_config(is_actor)
 
         if self.ds_tensor_parallel_size > 1:
@@ -277,7 +277,7 @@ class DeepspeedStrategy(ABC):
     def _ds_init_eval_model(self, model):
         if not model:
             return model
-        is_actor = isinstance(model, Actor)
+        is_actor = isinstance(model, Actor) or isinstance(model, VisionActor)
         ds_config = self.get_ds_eval_config(offload=getattr(model, "_offload", False))
 
         if self.ds_tensor_parallel_size > 1:
@@ -358,7 +358,7 @@ class DeepspeedStrategy(ABC):
         if self.args.zero_stage > 2 or self.args.ds_tensor_parallel_size > 1:
             output_state_dict = (
                 model.model._consolidated_16bit_state_dict()
-                if isinstance(model, Actor)
+                if isinstance(model, Actor) or isinstance(model, VisionActor)
                 else model._consolidated_16bit_state_dict()
             )
         else:
@@ -398,6 +398,10 @@ class DeepspeedStrategy(ABC):
             model_to_save.config.to_json_file(output_config_file)
             # save tokenizer
             tokenizer.save_pretrained(output_dir)
+            #save image processor
+            img_processor = kwargs.get("img_processor", None)
+            if img_processor is not None:
+                img_processor.save_pretrained(output_dir)
 
         del output_state_dict
         # Explicitly release memory
